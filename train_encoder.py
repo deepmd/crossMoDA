@@ -53,6 +53,8 @@ def parse_option():
                         help='weight decay')
     parser.add_argument('--momentum', type=float, default=0.9,
                         help='momentum')
+    parser.add_argument('--in_domain', type=int, default=100,
+                        help='epochs with in-domain loss only')
 
     # model dataset
     parser.add_argument('--model', type=str, default='resnet50')
@@ -101,7 +103,7 @@ def parse_option():
         opt.lr_decay_epochs.append(int(it))
 
     opt.model_name = f"{opt.dataset}_{opt.model}_prts_{opt.n_parts}_lr_{opt.learning_rate}_decay_{opt.weight_decay}_" + \
-                     f"bsz_{opt.batch_size}_bprts_{opt.batch_parts}_temp_{opt.temp}"
+                     f"bsz_{opt.batch_size}_bprts_{opt.batch_parts}_temp_{opt.temp}_indom_{opt.in_domain}"
 
     if opt.cosine:
         opt.model_name += "_cosine"
@@ -157,8 +159,7 @@ def set_loader(opt):
     train_loader = DataLoader(
         dataset=train_dataset,
         batch_sampler=batch_sampler,
-        num_workers=opt.num_workers,
-        pin_memory=True)
+        num_workers=opt.num_workers)
 
     return train_loader
 
@@ -216,22 +217,25 @@ def check_data(train_loader, opt):
             for v_idx, image_view in enumerate(image_views, start=1):
                 plt.subplot(1, cols, v_idx+1)
                 plt.title(f"View_{v_idx}")
-                plt.imshow(image_view, cmap="gray", interpolation="none")
-            plt.savefig(os.path.join(samples_path, f"batch_{idx}_item_{i}_{domain}_part_{part_num}.png"))
+                plt.imshow(image_view.cpu(), cmap="gray", interpolation="none")
+            plt.savefig(os.path.join(samples_path, f"batch_{idx}_item_{i+1}_{domain}_part_{part_num.item()+1}.png"))
     logger.info("-" * 10)
 
 
-def train(train_loader, model, criterion, optimizer, epoch, opt):
+def train(train_loader, model, criterion, optimizer, epoch, iters, opt):
     """one epoch training"""
     model.train()
 
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
+    sources = AverageMeter()
+    targets = AverageMeter()
 
     end = time.time()
     for idx, batch_data in enumerate(train_loader):
         data_time.update(time.time() - end)
+        iters[0] += 1
 
         bsz = batch_data["image"].shape[0] // 2
         source_images = batch_data["image"][:bsz]
@@ -265,20 +269,34 @@ def train(train_loader, model, criterion, optimizer, epoch, opt):
         target_loss = criterion(target_features, target_labels)
 
         # CROSS-DOMAIN
-        all_features = torch.cat((source_features, target_features), dim=0)
-        all_labels = torch.cat((source_labels, target_labels), dim=0)
-        mask_all = torch.eq(all_labels, all_labels.T).float()
-        mask_source = torch.eq(source_labels, source_labels.T).float()
-        mask_target = torch.eq(target_labels, target_labels.T).float()
-        mask_all[:bsz, :bsz] -= mask_source
-        mask_all[bsz:, bsz:] -= mask_target
-        cross_loss = criterion(all_features, mask=mask_all)
+        if epoch > opt.in_domain:
+            all_features = torch.cat((source_features, target_features), dim=0)
+            all_labels = torch.cat((source_labels, target_labels), dim=0)
+            mask_all = torch.eq(all_labels, all_labels.T).float()
+            mask_source = torch.eq(source_labels, source_labels.T).float()
+            mask_target = torch.eq(target_labels, target_labels.T).float()
+            mask_all[:bsz, :bsz] -= mask_source
+            mask_all[bsz:, bsz:] -= mask_target
+            cross_loss = criterion(all_features, mask=mask_all)
+        else:
+            cross_loss = 0
 
         # total loss
         loss = source_loss + target_loss + cross_loss
 
         # update metric
         losses.update(loss.item(), bsz)
+
+        # keeping source and target features avg
+        mean_source = torch.mean(source_features[:, 0, ...], dim=0)
+        sources.update(mean_source, bsz)
+        mean_target = torch.mean(target_features[:, 0, ...], dim=0)
+        targets.update(mean_target, bsz)
+        nmd = torch.dist(mean_source, mean_target, 2).item()  # Normalized Mean Distance / MMD under the linear kernel
+
+        # tensorboard logging
+        opt.tb_logger.add_scalar('iter/loss-iter', loss.item(), iters[0])
+        opt.tb_logger.add_scalar('iter/nmd-iter', nmd, iters[0])
 
         # SGD
         optimizer.zero_grad()
@@ -291,26 +309,28 @@ def train(train_loader, model, criterion, optimizer, epoch, opt):
 
         # print info
         if (idx + 1) % opt.print_freq == 0:
-            opt.logger.info('Train: [{0}][{1}/{2}]\t'
-                  'BT {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                  'DT {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                  'loss {loss.val:.3f} ({loss.avg:.3f})'.format(
-                   epoch, idx + 1, len(train_loader), batch_time=batch_time,
-                   data_time=data_time, loss=losses))
+            nmd_avg = torch.dist(sources.avg, targets.avg, 2).item()
+            opt.logger.info(f"Train: [{epoch}][{idx+1}/{len(train_loader)}]\t" +
+                f"BT {batch_time.val:.3f} ({batch_time.avg:.3f})\t" +
+                f"DT {data_time.val:.3f} ({data_time.avg:.3f})\t" +
+                f"loss {losses.val:.3f} ({losses.avg:.3f})\t" +
+                f"nmd {nmd:.3f} ({nmd_avg:.3f})")
 
-    return losses.avg
+    nmd_avg = torch.dist(sources.avg, targets.avg, 2).item()
+    return losses.avg, nmd_avg
 
 
 def main():
     opt = parse_option()
 
-    # tensorboard
-    tb_logger = SummaryWriter(log_dir=opt.tb_folder, flush_secs=2)
-
     # logger
     logger = set_up_logger(logs_path=opt.log_folder)
     log_parameters(opt, logger)
     opt.logger = logger
+
+    # tensorboard
+    tb_logger = SummaryWriter(log_dir=opt.tb_folder, flush_secs=2)
+    opt.tb_logger = tb_logger
 
     # build data loader
     train_loader = set_loader(opt)
@@ -324,18 +344,20 @@ def main():
     if opt.debug:
         check_data(train_loader, opt)
 
+    iters = [0]
     # training routine
     for epoch in range(1, opt.epochs + 1):
         adjust_learning_rate(opt, optimizer, epoch)
 
         # train for one epoch
         time1 = time.time()
-        loss = train(train_loader, model, criterion, optimizer, epoch, opt)
+        loss, nmd = train(train_loader, model, criterion, optimizer, epoch, iters, opt)
         time2 = time.time()
-        logger.info('epoch {}, total time {:.2f}'.format(epoch, time2 - time1))
+        logger.info(f"epoch {epoch}, total time {(time2 - time1):.2f}, avg_loss {loss:.3f}, avg_nmd {nmd:.3f}")
 
-        # tensorboard logger
-        tb_logger.add_scalar('loss', loss, epoch)
+        # tensorboard logging
+        tb_logger.add_scalar('epoch/loss', loss, epoch)
+        tb_logger.add_scalar('epoch/nmd', nmd, epoch)
         tb_logger.add_scalar('learning_rate', optimizer.param_groups[0]['lr'], epoch)
 
         if epoch % opt.save_freq == 0:

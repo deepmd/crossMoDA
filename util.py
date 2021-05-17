@@ -78,8 +78,9 @@ def set_optimizer(opt, model):  ## Paper states that the best result achieved by
 
 def save_model(model, optimizer, opt, epoch, save_file):
     opt.logger.info(f'==> Saving... "{save_file}"')
+    opt_dict = {k: v for k, v in opt.__dict__.items() if k not in ["logger", "tb_logger"]}
     state = {
-        'opt': opt,
+        'opt': opt_dict,
         'model': model.state_dict(),
         'optimizer': optimizer.state_dict(),
         'epoch': epoch,
@@ -98,7 +99,7 @@ def set_up_logger(logs_path, log_file_name=None):
     consoleHandler = logging.StreamHandler()
     logger.addHandler(fileHandler)
     logger.addHandler(consoleHandler)
-    formatter = logging.Formatter("%(asctime)s %(levelname)s        %(message)s")
+    formatter = logging.Formatter("%(asctime)s,%(msecs)03d %(levelname)s        %(message)s", datefmt="%H:%M:%S")
     fileHandler.setFormatter(formatter)
     consoleHandler.setFormatter(formatter)
     logger.setLevel(logging.INFO)

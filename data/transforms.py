@@ -85,7 +85,12 @@ class Clipd(MapTransform):
     def __call__(self, data: Mapping[Hashable, np.ndarray]) -> Dict[Hashable, np.ndarray]:
         d = dict(data)
         for key in self.key_iterator(d):
-            d[key] = np.clip(d[key], a_min=self.minv, a_max=self.maxv)
+            if isinstance(d[key], torch.Tensor):
+                d[key] = torch.clip(d[key], min=self.minv, max=self.maxv)
+            elif isinstance(d[key], np.ndarray):
+                d[key] = np.clip(d[key], a_min=self.minv, a_max=self.maxv)
+            else:
+                raise TypeError(f"Cannot clip data of type {type(d[key]).__name__}.")
         return d
 
 
@@ -131,20 +136,32 @@ class RandMultiTransformd(Compose, MapTransform):
             keys_in_views = [[self.views_keys[k][i] for k in keys] for i in range(times)]
             view_transforms = [Compose(view_transforms(keys)) for keys in keys_in_views]
         all_views_keys = list(chain.from_iterable(self.views_keys.values()))
-        # shallow copy of original keys (image -> image_orig, ...) for debugging purposes
+
+        # Shallow copy of original keys (image -> image_orig, ...) for debugging purposes
         if keep_orig:
             def copy_orig(d):
                 for key in self.views_keys.keys():
                     d.update({key+"_orig": d[key]})
                 return d
             view_transforms.append(Lambda(func=copy_orig))
-        # Adds a new dimension at 'dim' to all views (image_1, ...)
-        view_transforms.append(Lambdad(keys=all_views_keys, func=lambda d: np.expand_dims(d, axis=view_dim)))
-        # Concatenates views on dimension 'dim' and writes the result over original keys cat(image_1, image_2) -> image
+
+        # Adds a new dimension at 'view_dim' to all views (image_1, ...)
+        def add_dim(d):
+            if isinstance(d, torch.Tensor):
+                return torch.unsqueeze(d, dim=view_dim)
+            elif isinstance(d, np.ndarray):
+                return np.expand_dims(d, axis=view_dim)
+            else:
+                raise TypeError(f"Cannot expand dimension of type {type(d).__name__}.")
+        view_transforms.append(Lambdad(keys=all_views_keys, func=add_dim))
+
+        # Concatenates views on dimension 'view_dim' and writes the result over original keys cat(image_1, image_2) -> image
         view_transforms.extend(
             [ConcatItemsd(keys=keys, name=orig_key, dim=view_dim) for (orig_key, keys) in self.views_keys.items()])
+
         # Deletes all views (image_1, ...)
         view_transforms.append(DeleteItemsd(keys=all_views_keys))
+
         Compose.__init__(self, view_transforms)
 
     def __call__(self, data: Mapping[Hashable, np.ndarray]) -> Dict[Hashable, np.ndarray]:
