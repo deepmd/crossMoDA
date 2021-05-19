@@ -68,7 +68,7 @@ def warmup_learning_rate(args, epoch, batch_id, total_batches, optimizer):
             param_group['lr'] = lr
 
 
-def set_optimizer(opt, model):  ## Paper states that the best result achieved by LARS optimizer for embedding network and RMSProp for linear classifier (p.21)
+def set_optimizer(opt, model):
     optimizer = optim.SGD(model.parameters(),
                           lr=opt.learning_rate,
                           momentum=opt.momentum,
@@ -78,15 +78,21 @@ def set_optimizer(opt, model):  ## Paper states that the best result achieved by
 
 def save_model(model, optimizer, opt, epoch, save_file):
     opt.logger.info(f'==> Saving... "{save_file}"')
-    opt_dict = {k: v for k, v in opt.__dict__.items() if k not in ["logger", "tb_logger"]}
+    opt_dict = {k: v for k, v in opt.__dict__.items() if k != "logger"}
     state = {
         'opt': opt_dict,
-        'model': model.state_dict(),
+        'model': strip_DataParallel(model).state_dict(),
         'optimizer': optimizer.state_dict(),
         'epoch': epoch,
     }
     torch.save(state, save_file)
     del state
+
+
+def strip_DataParallel(net):
+    if isinstance(net, torch.nn.DataParallel):
+        return strip_DataParallel(net.module)
+    return net
 
 
 def set_up_logger(logs_path, log_file_name=None):

@@ -1,5 +1,5 @@
-from monai.networks.nets import SegResNet
-from typing import Union, Optional, Tuple
+from monai.networks.nets import SegResNet as monaiSegResNet
+from typing import Union, Optional
 from monai.utils import UpsampleMode
 
 import torch
@@ -29,7 +29,7 @@ class Projection(nn.Module):
         return x
 
 
-class SegResNet(SegResNet):
+class SegResNet(monaiSegResNet):
     def __init__(
             self,
             spatial_dims: int = 3,
@@ -66,7 +66,7 @@ class SegResNet(SegResNet):
             self.up_samples = None
             input_projection_size = pow(2, len(self.down_layers) - 1) * self.init_filters
             self.projection = Projection(head=head, dim_in=input_projection_size, feat_dim=feat_dim)
-        self.backbone = nn.Sequential(self.down_layers)
+        self.encoder = nn.Sequential(self.down_layers)
 
     def forward(self, x):
         x = self.convInit(x)

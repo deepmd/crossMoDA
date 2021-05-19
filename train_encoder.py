@@ -1,5 +1,4 @@
 import os
-import sys
 import argparse
 import time
 import math
@@ -16,7 +15,7 @@ from util import AverageMeter
 from util import adjust_learning_rate, warmup_learning_rate
 from util import set_optimizer, save_model
 from util import set_up_logger, log_parameters
-from networks.resnet_big import SupConResNet
+from networks.segresnet import SegResNet
 from losses import SupConLoss
 from data.dataset import CachePartDataset
 from data.sampler import MultiDomainBatchSampler
@@ -58,7 +57,7 @@ def parse_option():
                         help='epochs with in-domain loss only')
 
     # model dataset
-    parser.add_argument('--model', type=str, default='resnet50')
+    parser.add_argument('--model', type=str, default='SegResNet')
     parser.add_argument('--dataset', type=str, default='VS_SEG',
                         choices=['VS_SEG', 'crossMoDA'], help='dataset')
     parser.add_argument("--split", type=str, default="split.csv",
@@ -91,9 +90,6 @@ def parse_option():
     # set the path according to the environment
     if opt.data_folder is None:
         opt.data_folder = './datasets/'
-    opt.model_path = './save/{}_models'.format(opt.dataset)
-    opt.tb_path = './save/{}_tensorboard'.format(opt.dataset)
-    opt.log_path = './save/{}_logs'.format(opt.dataset)
 
     if opt.batch_parts is None:
         opt.batch_parts = opt.n_parts
@@ -103,7 +99,7 @@ def parse_option():
     for it in iterations:
         opt.lr_decay_epochs.append(int(it))
 
-    opt.model_name = f"{opt.dataset}_{opt.model}_prts_{opt.n_parts}_lr_{opt.learning_rate}_decay_{opt.weight_decay}_" + \
+    opt.model_name = f"{opt.dataset}_enc_{opt.model}_prts_{opt.n_parts}_lr_{opt.learning_rate}_decay_{opt.weight_decay}_" + \
                      f"bsz_{opt.batch_size}_bprts_{opt.batch_parts}_temp_{opt.temp}_indom_{opt.in_domain}"
 
     if opt.cosine:
@@ -125,15 +121,17 @@ def parse_option():
 
     opt.model_name += f"_trial_{opt.trial}"
 
-    opt.tb_folder = os.path.join(opt.tb_path, opt.model_name)
+    save_path = os.path.join("./save", opt.model_name)
+
+    opt.tb_folder = os.path.join(save_path, "tensorboard")
     if not os.path.isdir(opt.tb_folder):
         os.makedirs(opt.tb_folder)
 
-    opt.save_folder = os.path.join(opt.model_path, opt.model_name)
+    opt.save_folder = os.path.join(save_path, "models")
     if not os.path.isdir(opt.save_folder):
         os.makedirs(opt.save_folder)
 
-    opt.log_folder = os.path.join(opt.log_path, opt.model_name)
+    opt.log_folder = os.path.join(save_path, "logs")
     if not os.path.isdir(opt.log_folder):
         os.makedirs(opt.log_folder)
 
@@ -167,7 +165,19 @@ def set_loader(opt):
 
 
 def set_model(opt):
-    model = SupConResNet(name=opt.model)
+    model = SegResNet(
+        spatial_dims=2,
+        init_filters=32,
+        in_channels=1,
+        out_channels=2,
+        blocks_down=(1, 2, 2, 4, 4, 4),
+        blocks_up=(1, 1, 1, 1, 1),
+        upsample_mode="deconv",
+        use_decoder=False,
+        dropout_prob=0.2,
+        head='mlp',
+        feat_dim=128
+    )
     criterion = SupConLoss(temperature=opt.temp)
 
     # enable synchronized Batch Normalization
@@ -176,7 +186,7 @@ def set_model(opt):
 
     if torch.cuda.is_available():
         if torch.cuda.device_count() > 1:
-            model.encoder = torch.nn.DataParallel(model.encoder)
+            model = torch.nn.DataParallel(model)
         model = model.cuda()
         criterion = criterion.cuda()
         cudnn.benchmark = True
@@ -294,11 +304,6 @@ def train(train_loader, model, criterion, optimizer, epoch, iters, opt):
         sources.update(mean_source, bsz)
         mean_target = torch.mean(target_features[:, 0, ...], dim=0)
         targets.update(mean_target, bsz)
-        nmd = torch.dist(mean_source, mean_target, 2).item()  # Normalized Mean Distance / MMD under the linear kernel
-
-        # tensorboard logging
-        opt.tb_logger.add_scalar('iter/loss-iter', loss.item(), iters[0])
-        opt.tb_logger.add_scalar('iter/nmd-iter', nmd, iters[0])
 
         # SGD
         optimizer.zero_grad()
@@ -311,6 +316,8 @@ def train(train_loader, model, criterion, optimizer, epoch, iters, opt):
 
         # print info
         if (idx + 1) % opt.print_freq == 0:
+            # calculate current and average Normalized Mean Distance
+            nmd = torch.dist(mean_source, mean_target, 2).item()
             nmd_avg = torch.dist(sources.avg, targets.avg, 2).item()
             opt.logger.info(f"Train: [{epoch}][{idx+1}/{len(train_loader)}]\t" +
                 f"BT {batch_time.val:.3f} ({batch_time.avg:.3f})\t" +
@@ -332,7 +339,6 @@ def main():
 
     # tensorboard
     tb_logger = SummaryWriter(log_dir=opt.tb_folder, flush_secs=2)
-    opt.tb_logger = tb_logger
 
     # build data loader
     train_loader = set_loader(opt)
