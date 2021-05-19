@@ -39,10 +39,11 @@ def load_data(opt):
     logger.info("Number of images in training (target)  = {}".format(len(train_files[1])))
     logger.info("Number of images in validation         = {}".format(len(val_files)))
     logger.info("Number of images in test set           = {}".format(len(test_files)))
-    logger.info("training set (source)  = {}".format(train_files[0]))
-    logger.info("training set (target)  = {}".format(train_files[1]))
-    logger.info("validation set         = {}".format(val_files))
-    logger.info("test set               = {}".format(test_files))
+    if opt.debug:
+        logger.info("training set (source)  = {}".format(train_files[0]))
+        logger.info("training set (target)  = {}".format(train_files[1]))
+        logger.info("validation set         = {}".format(val_files))
+        logger.info("test set               = {}".format(test_files))
 
     # return as dictionaries of image/label pairs
     return train_files, val_files, test_files

@@ -1,9 +1,9 @@
-from .transforms import get_encoder_source_transforms, get_encoder_target_transforms
+from .transforms import encoder_transforms
 from .data import load_data
 
 
 def get_encoder_transforms(opt):
-    return get_encoder_source_transforms(opt), get_encoder_target_transforms(opt)
+    return encoder_transforms(opt, "source"), encoder_transforms(opt, "target")
 
 
 def get_data(opt):

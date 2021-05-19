@@ -129,6 +129,7 @@ class RandMultiTransformd(Compose, MapTransform):
         if times < 1:
             raise ValueError(f"times must be positive, got {times}.")
         self.times = times
+        self.view_dim = view_dim
         self.views_keys = {k: [f"{k}_{i+1}" for i in range(times)] for k in keys}
         if view_transforms is None:
             view_transforms = []
@@ -136,33 +137,31 @@ class RandMultiTransformd(Compose, MapTransform):
             keys_in_views = [[self.views_keys[k][i] for k in keys] for i in range(times)]
             view_transforms = [Compose(view_transforms(keys)) for keys in keys_in_views]
         all_views_keys = list(chain.from_iterable(self.views_keys.values()))
-
         # Shallow copy of original keys (image -> image_orig, ...) for debugging purposes
         if keep_orig:
-            def copy_orig(d):
-                for key in self.views_keys.keys():
-                    d.update({key+"_orig": d[key]})
-                return d
-            view_transforms.append(Lambda(func=copy_orig))
-
+            view_transforms.append(Lambda(func=self._copy_orig))
         # Adds a new dimension at 'view_dim' to all views (image_1, ...)
-        def add_dim(d):
-            if isinstance(d, torch.Tensor):
-                return torch.unsqueeze(d, dim=view_dim)
-            elif isinstance(d, np.ndarray):
-                return np.expand_dims(d, axis=view_dim)
-            else:
-                raise TypeError(f"Cannot expand dimension of type {type(d).__name__}.")
-        view_transforms.append(Lambdad(keys=all_views_keys, func=add_dim))
-
+        view_transforms.append(Lambdad(keys=all_views_keys, func=self._add_dim))
         # Concatenates views on dimension 'view_dim' and writes the result over original keys cat(image_1, image_2) -> image
         view_transforms.extend(
             [ConcatItemsd(keys=keys, name=orig_key, dim=view_dim) for (orig_key, keys) in self.views_keys.items()])
-
         # Deletes all views (image_1, ...)
         view_transforms.append(DeleteItemsd(keys=all_views_keys))
 
         Compose.__init__(self, view_transforms)
+
+    def _copy_orig(self, d):
+        for key in self.views_keys.keys():
+            d.update({key + "_orig": d[key]})
+        return d
+
+    def _add_dim(self, d):
+        if isinstance(d, torch.Tensor):
+            return torch.unsqueeze(d, dim=self.view_dim)
+        elif isinstance(d, np.ndarray):
+            return np.expand_dims(d, axis=self.view_dim)
+        else:
+            raise TypeError(f"Cannot expand dimension of type {type(d).__name__}.")
 
     def __call__(self, data: Mapping[Hashable, np.ndarray]) -> Dict[Hashable, np.ndarray]:
         d = dict(data)
