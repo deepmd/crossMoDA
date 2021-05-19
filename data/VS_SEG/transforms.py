@@ -1,5 +1,5 @@
 import numpy as np
-from data.transforms import RandMultiTransformd, RandSampleSlice, Clipd, Spacing2Dd, AlignCropd
+from data.transforms import RandMultiTransformd, RandSampleSlice, Spacing2Dd, AlignCropd
 from monai.transforms import \
     Compose, LoadImaged, AddChanneld, NormalizeIntensityd, ScaleIntensityRangePercentilesd, \
     RandFlipd, RandSpatialCropd, RandScaleIntensityd, Orientationd, ToTensord, RandAffined, \
@@ -38,7 +38,7 @@ def encoder_transforms(opt, domain):
                     RandScaleIntensityd(keys=keys[0], factors=0.1, prob=0.5),  # v = v * (1 + U(-0.1, 0.1))
                     RandShiftIntensityd(keys=keys[0], offsets=0.1, prob=0.5),  # v = v + U(-0.1, 0.1)
                     RandGaussianNoised(keys=keys[0], std=0.1, prob=1),  # std=U(0, 0.1) mean=0
-                    RandFlipd(keys=keys, prob=0.5, spatial_axis=0),
+                    RandFlipd(keys=keys, spatial_axis=0, prob=0.5),
                     RandAffined(keys=keys, scale_range=0.1, rotate_range=np.pi/18, prob=1),
                     RandSpatialCropd(keys=keys, roi_size=(opt.size, opt.size), random_center=True, random_size=False)
                 ]
@@ -55,9 +55,9 @@ def _source_align_roi(img, meta_dict):
     if dim[0] != 512 or dim[1] != 512:
         raise ValueError(f"Unexpected values for dim-xy={dim[:2]}.")
     if dim[2] == 120 and pixdim_z == 1.5:
-        return [cm, cm, 66], [dim[0] - cm, dim[1] - cm, 97]
+        return [cm, cm, dim[2]-97], [dim[0]-cm, dim[1]-cm, dim[2]-66]
     elif dim[2] == 160 and pixdim_z == 1:
-        return [cm, cm, 95], [dim[0] - cm, dim[1] - cm, 147]
+        return [cm, cm, dim[2]-145], [dim[0]-cm, dim[1]-cm, dim[2]-95]
     else:
         file_name = meta_dict["filename_or_obj"]
         raise ValueError(f"Unexpected values for dim-z={dim[2]} or pixdim-z={pixdim_z} in file {file_name}.")
@@ -70,9 +70,9 @@ def _target_align_roi(img, meta_dict):
     if dim[0] != 512 or dim[1] != 512:
         raise ValueError(f"Unexpected values for dim-xy={dim[:2]}.")
     if dim[2] == 80 and pixdim_z == 1.5:
-        return [cm, cm, 35], [dim[0]-cm, dim[1]-cm, 70]
+        return [cm, cm, dim[2]-70], [dim[0]-cm, dim[1]-cm, dim[2]-35]
     elif dim[2] == 80 and pixdim_z == 1:
-        return [cm, cm, 10], [dim[0]-cm, dim[1]-cm, 65]
+        return [cm, cm, dim[2]-65], [dim[0]-cm, dim[1]-cm, dim[2]-10]
     if dim[2] == 40 and pixdim_z == 1.5:
         return [cm, cm, 0], [dim[0]-cm, dim[1]-cm, 40]
     else:
