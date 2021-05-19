@@ -10,6 +10,7 @@ from torch.utils.data import ConcatDataset
 from torch.utils.tensorboard import SummaryWriter
 from monai.data import DataLoader
 from matplotlib import pyplot as plt
+from tqdm import tqdm
 
 from util import AverageMeter
 from util import adjust_learning_rate, warmup_learning_rate
@@ -159,7 +160,8 @@ def set_loader(opt):
     train_loader = DataLoader(
         dataset=train_dataset,
         batch_sampler=batch_sampler,
-        num_workers=opt.num_workers)
+        num_workers=opt.num_workers,
+        pin_memory=True)
 
     return train_loader
 
@@ -192,7 +194,7 @@ def check_data(train_loader, opt):
     logger.info("Summary of the training data")
     logger.info(f"number of volumes    = {len(train_loader.dataset)}")
     logger.info(f"number of batches    = {len(train_loader)}")
-    for idx, batch_data in enumerate(train_loader, start=1):
+    for idx, batch_data in enumerate(tqdm(train_loader, desc="Saving sampled data"), start=1):
         if first_batch:
             logger.info(f"data keys            = {list(batch_data.keys())}")
             image_orig = batch_data["image_orig"][0]
@@ -353,7 +355,7 @@ def main():
         time1 = time.time()
         loss, nmd = train(train_loader, model, criterion, optimizer, epoch, iters, opt)
         time2 = time.time()
-        logger.info(f"epoch {epoch}, total time {(time2 - time1):.2f}, avg_loss {loss:.3f}, avg_nmd {nmd:.3f}")
+        logger.info(f"epoch {epoch}, total_time {(time2 - time1):.2f}, avg_loss {loss:.3f}, avg_nmd {nmd:.3f}")
 
         # tensorboard logging
         tb_logger.add_scalar('epoch/loss', loss, epoch)
@@ -372,4 +374,6 @@ def main():
 
 
 if __name__ == '__main__':
+    # if torch.cuda.device_count() > 1:
+    #     torch.multiprocessing.set_start_method('spawn')
     main()

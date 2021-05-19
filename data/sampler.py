@@ -39,19 +39,20 @@ class MultiDomainBatchSampler(Sampler[List[int]]):
         # Iterates batch_vols_num items at a time from vol_sampler
         for vol_idxs in zip_longest(*[iter(self.vol_sampler)]*self.batch_vols_num, fillvalue=None):
             if None not in vol_idxs or not self.drop_last:
-                domain_batch = []
                 # Iterates batch_parts_num items at a time from part_sampler
                 for part_idxs in zip(*[iter(self.part_sampler)]*self.batch_parts_num):
                     domain_batch = [(vi * self.parts_num + pi) for vi in vol_idxs for pi in part_idxs if vi is not None]
-                batch = []
-                cumsum_parts_num = 0
-                for domain_parts_num in self.domains_parts_num:
-                    batch.extend([(idx % domain_parts_num + cumsum_parts_num) for idx in domain_batch])
-                    cumsum_parts_num += domain_parts_num
-                yield batch
+                    batch = []
+                    cumsum_parts_num = 0
+                    for domain_parts_num in self.domains_parts_num:
+                        batch.extend([(idx % domain_parts_num + cumsum_parts_num) for idx in domain_batch])
+                        cumsum_parts_num += domain_parts_num
+                    yield batch
 
     def __len__(self):
         if self.drop_last:
-            return len(self.vol_sampler) // self.batch_vols_num
+            vol_sampling_num = len(self.vol_sampler) // self.batch_vols_num
         else:
-            return (len(self.vol_sampler) + self.batch_vols_num - 1) // self.batch_vols_num
+            vol_sampling_num = (len(self.vol_sampler) + self.batch_vols_num - 1) // self.batch_vols_num
+        part_sampling_num = len(self.part_sampler) // self.batch_parts_num
+        return vol_sampling_num * part_sampling_num
