@@ -338,7 +338,7 @@ def main():
     opt.logger = logger
 
     # tensorboard
-    tb_logger = SummaryWriter(log_dir=opt.tb_folder, flush_secs=2)
+    tb_logger = SummaryWriter(log_dir=opt.tb_folder, flush_secs=30)
 
     # build data loader
     train_loader = set_loader(opt)
@@ -364,8 +364,8 @@ def main():
         logger.info(f"epoch {epoch}, total_time {(time2 - time1):.2f}, avg_loss {loss:.3f}, avg_nmd {nmd:.3f}")
 
         # tensorboard logging
-        tb_logger.add_scalar('epoch/loss', loss, epoch)
-        tb_logger.add_scalar('epoch/nmd', nmd, epoch)
+        tb_logger.add_scalar('metric/loss', loss, epoch)
+        tb_logger.add_scalar('metric/nmd', nmd, epoch)
         tb_logger.add_scalar('learning_rate', optimizer.param_groups[0]['lr'], epoch)
 
         if epoch % opt.save_freq == 0:
