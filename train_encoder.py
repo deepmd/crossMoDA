@@ -3,6 +3,7 @@ import argparse
 import time
 import math
 
+import monai
 import torch
 import torch.backends.cudnn as cudnn
 from torch.utils.data import ConcatDataset
@@ -15,7 +16,7 @@ from util import AverageMeter
 from util import adjust_learning_rate, warmup_learning_rate
 from util import set_optimizer, save_model
 from util import set_up_logger, log_parameters
-from networks.segresnet import SegResNet
+from networks import get_encoder_model
 from losses import SupConLoss
 from data.dataset import CachePartDataset
 from data.sampler import MultiDomainBatchSampler
@@ -57,7 +58,8 @@ def parse_option():
                         help='epochs with in-domain loss only')
 
     # model dataset
-    parser.add_argument('--model', type=str, default='SegResNet')
+    parser.add_argument('--model', type=str,
+                        choices=['SegResNet', 'ResUNet', 'ResUNet++'])
     parser.add_argument('--dataset', type=str, default='VS_SEG',
                         choices=['VS_SEG', 'crossMoDA'], help='dataset')
     parser.add_argument("--split", type=str, default="split.csv",
@@ -165,19 +167,7 @@ def set_loader(opt):
 
 
 def set_model(opt):
-    model = SegResNet(
-        spatial_dims=2,
-        init_filters=32,
-        in_channels=1,
-        out_channels=2,
-        blocks_down=(1, 2, 2, 4, 4, 4),
-        blocks_up=(1, 1, 1, 1, 1),
-        upsample_mode="deconv",
-        use_decoder=False,
-        dropout_prob=0.2,
-        head='mlp',
-        feat_dim=128
-    )
+    model = get_encoder_model(opt)
     criterion = SupConLoss(temperature=opt.temp)
 
     # enable synchronized Batch Normalization
@@ -331,6 +321,10 @@ def train(train_loader, model, criterion, optimizer, epoch, iters, opt):
 
 def main():
     opt = parse_option()
+
+    # Set deterministic training for reproducibility
+    monai.utils.set_determinism(2147483647)
+    cudnn.deterministic = False  # due to performance issues
 
     # logger
     logger = set_up_logger(logs_path=opt.log_folder)

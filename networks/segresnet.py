@@ -8,6 +8,11 @@ from torch import nn
 
 
 class SegResNet(monaiSegResNet):
+    """
+        Based on "3D MRI brain tumor segmentation using autoencoder regularization"
+        https://arxiv.org/abs/1810.11654
+        The module does not include the variational autoencoder (VAE).
+    """
     def __init__(
             self,
             spatial_dims: int = 3,
@@ -42,9 +47,10 @@ class SegResNet(monaiSegResNet):
         if not self.use_decoder:
             self.up_layers = None
             self.up_samples = None
+            self.conv_final = None
             input_projection_size = pow(2, len(self.down_layers) - 1) * self.init_filters
             self.projection = Projection(head=head, dim_in=input_projection_size, feat_dim=feat_dim)
-        self.encoder = nn.Sequential(self.down_layers)
+        self.encoder = nn.Sequential(self.convInit, *self.down_layers)
 
     def forward(self, x):
         x = self.convInit(x)
@@ -75,7 +81,7 @@ class SegResNet(monaiSegResNet):
 if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = SegResNet(spatial_dims=2,
-                      init_filters=8,
+                      init_filters=32,
                       in_channels=1,
                       out_channels=2,
                       blocks_down=(1, 2, 2, 4, 4, 4),

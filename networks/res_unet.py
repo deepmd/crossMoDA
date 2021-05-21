@@ -1,13 +1,18 @@
 import torch
 import torch.nn as nn
-from modules import ResidualConv, Upsample, Projection
+from .modules import ResidualConv, Upsample, Projection
 
 
 class ResUnet(nn.Module):
+    """
+        Based on "Road Extraction by Deep Residual U-Net"
+        https://arxiv.org/abs/1711.10684
+    """
     def __init__(
             self,
-            channel,
-            filters=[64, 128, 256, 512],
+            in_channels=1,
+            out_channels=2,
+            filters=(64, 128, 256, 512),
             use_decoder=True,
             head='mlp',
             feat_dim=128):
@@ -19,13 +24,13 @@ class ResUnet(nn.Module):
             self.projection = Projection(head=head, dim_in=filters[-1], feat_dim=feat_dim)
 
         self.input_layer = nn.Sequential(
-            nn.Conv2d(channel, filters[0], kernel_size=3, padding=1),
+            nn.Conv2d(in_channels, filters[0], kernel_size=3, padding=1),
             nn.BatchNorm2d(filters[0]),
             nn.ReLU(),
             nn.Conv2d(filters[0], filters[0], kernel_size=3, padding=1),
         )
         self.input_skip = nn.Sequential(
-            nn.Conv2d(channel, filters[0], kernel_size=3, padding=1)
+            nn.Conv2d(in_channels, filters[0], kernel_size=3, padding=1)
         )
 
         self.residual_conv_1 = ResidualConv(filters[0], filters[1], 2, 1)
@@ -47,10 +52,7 @@ class ResUnet(nn.Module):
             self.upsample_4 = Upsample(filters[1], filters[1], 2, 2)
             self.up_residual_conv4 = ResidualConv(filters[1] + filters[0], filters[0], 1, 1)
 
-            self.output_layer = nn.Sequential(
-                nn.Conv2d(filters[1], 1, 1, 1),
-                nn.Sigmoid(),
-            )
+            self.output_layer = nn.Conv2d(filters[1], out_channels, 1, 1)
 
     def forward(self, x):
         # Encode
@@ -88,8 +90,9 @@ class ResUnet(nn.Module):
 
 if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = ResUnet(channel=1,
-                    filters=[64, 128, 256, 512, 1024],
+    model = ResUnet(in_channels=1,
+                    out_channels=2,
+                    filters=(64, 128, 256, 512, 1024),
                     use_decoder=False,
                     head='mlp',
                     feat_dim=128,
