@@ -105,7 +105,7 @@ class Upsample_(nn.Module):
     def __init__(self, scale=2):
         super(Upsample_, self).__init__()
 
-        self.upsample = nn.Upsample(mode="bilinear", scale_factor=scale)
+        self.upsample = nn.Upsample(mode="bilinear", scale_factor=scale, align_corners=True)
 
     def forward(self, x):
         return self.upsample(x)
