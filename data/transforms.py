@@ -1,5 +1,5 @@
 from itertools import chain
-from typing import Mapping, Hashable, Dict, Sequence, Optional, Callable, Union
+from typing import Mapping, Hashable, Dict, Sequence, Optional, Callable, Union, Any
 import numpy as np
 import torch
 from copy import deepcopy
@@ -7,7 +7,7 @@ from monai.config import KeysCollection, DtypeLike
 from monai.transforms.spatial.dictionary import GridSampleModeSequence, GridSamplePadModeSequence
 from monai.utils import GridSampleMode, GridSamplePadMode, ensure_tuple
 from monai.transforms import \
-    MapTransform, Randomizable, Compose, ConcatItemsd, DeleteItemsd, Lambdad, Spacingd, Lambda
+    MapTransform, Randomizable, Compose, ConcatItemsd, DeleteItemsd, Lambdad, Spacingd, Lambda, Transform
 
 
 class Spacing2Dd(Spacingd):
@@ -92,6 +92,18 @@ class Clipd(MapTransform):
             else:
                 raise TypeError(f"Cannot clip data of type {type(d[key]).__name__}.")
         return d
+
+
+class EndOfCache(Randomizable, Transform):
+    """
+    Return unchanged input data. It can be used to separate cached transforms from non-cached transforms.
+    """
+
+    def randomize(self, data: Any) -> None:
+        pass
+
+    def __call__(self, data: Any) -> Any:
+        return data
 
 
 class RandSampleSlice(Randomizable, MapTransform):

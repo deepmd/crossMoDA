@@ -18,9 +18,9 @@ from util import set_optimizer, save_model
 from util import set_up_logger, log_parameters
 from networks import get_encoder_model
 from losses import SupConLoss
-from data.dataset import CachePartDataset
+from data.dataset import CachePartDataset, CacheSliceDataset
 from data.sampler import MultiDomainBatchSampler
-from data.VS_SEG import get_encoder_transforms, get_data
+from data.VS_SEG import get_encoder_train_transforms, get_encoder_val_transforms, get_data
 
 
 def parse_option():
@@ -83,12 +83,6 @@ def parse_option():
 
     opt = parser.parse_args()
 
-    # check if dataset is path that passed required arguments
-    if opt.dataset == 'path':
-        assert opt.data_folder is not None \
-            and opt.mean is not None \
-            and opt.std is not None
-
     # set the path according to the environment
     if opt.data_folder is None:
         opt.data_folder = './datasets/'
@@ -141,17 +135,19 @@ def parse_option():
 
 
 def set_loader(opt):
-    source_transform, target_transform = get_encoder_transforms(opt)
-    (source_train_data, target_train_data), _, _ = get_data(opt)
+    source_train_transform, target_train_transform = get_encoder_train_transforms(opt)
+    source_val_transform, target_val_transform = get_encoder_val_transforms(opt)
+    (source_train_data, target_train_data), (source_val_data, target_val_data), _ = get_data(opt)
+
+    # train data
     if len(source_train_data) != len(target_train_data):
         raise ValueError(f"Length of source domain train data {(len(source_train_data))} is not equal to "
                          f"the length of target domain train data ({len(target_train_data)}).")
-
-    source_dataset = CachePartDataset(data=source_train_data, transform=source_transform, parts_num=opt.n_parts,
-                                      keys=["image"], copy_other_keys=True, num_workers=opt.num_workers)
-    target_dataset = CachePartDataset(data=target_train_data, transform=target_transform, parts_num=opt.n_parts,
-                                      keys=["image"], copy_other_keys=True, num_workers=opt.num_workers)
-    train_dataset = ConcatDataset([source_dataset, target_dataset])
+    source_train_dataset = CachePartDataset(data=source_train_data, transform=source_train_transform,
+                                            parts_num=opt.n_parts, keys=["image"], num_workers=opt.num_workers)
+    target_train_dataset = CachePartDataset(data=target_train_data, transform=target_train_transform,
+                                            parts_num=opt.n_parts, keys=["image"], num_workers=opt.num_workers)
+    train_dataset = ConcatDataset([source_train_dataset, target_train_dataset])
     batch_sampler = MultiDomainBatchSampler(
         domains_lengths=[len(source_train_data), len(target_train_data)],
         batch_size=opt.batch_size,
@@ -163,7 +159,23 @@ def set_loader(opt):
         num_workers=opt.num_workers,
         pin_memory=True)
 
-    return train_loader
+    # validation data
+    source_val_dataset = CacheSliceDataset(data=source_val_data, transform=source_val_transform,
+                                           keys=["image"], num_workers=opt.num_workers)
+    target_val_dataset = CacheSliceDataset(data=target_val_data, transform=target_val_transform,
+                                           keys=["image"], num_workers=opt.num_workers)
+    source_val_loader = DataLoader(
+        dataset=source_val_dataset,
+        batch_size=math.ceil(opt.batch_size//2),
+        num_workers=opt.num_workers//3,
+        pin_memory=True)
+    target_val_loader = DataLoader(
+        dataset=target_val_dataset,
+        batch_size=math.ceil(opt.batch_size//2),
+        num_workers=opt.num_workers//3,
+        pin_memory=True)
+
+    return train_loader, source_val_loader, target_val_loader
 
 
 def set_model(opt):
@@ -319,6 +331,36 @@ def train(train_loader, model, criterion, optimizer, epoch, iters, opt):
     return losses.avg, nmd_avg
 
 
+def validate(source_val_loader, target_val_loader, model):
+    """validation"""
+    model.eval()
+
+    with torch.no_grad():
+        source_features = []
+        for batch_data in source_val_loader:
+            images = batch_data["image"]
+            if torch.cuda.is_available():
+                images = images.cuda(non_blocking=True)
+            features = model(images)
+            source_features.append(features)
+        source_features = torch.cat(source_features, dim=0)
+
+        target_features = []
+        for batch_data in target_val_loader:
+            images = batch_data["image"]
+            if torch.cuda.is_available():
+                images = images.cuda(non_blocking=True)
+            features = model(images)
+            target_features.append(features)
+        target_features = torch.cat(target_features, dim=0)
+
+        mean_source = torch.mean(source_features, dim=0)
+        mean_target = torch.mean(target_features, dim=0)
+        nmd = torch.dist(mean_source, mean_target, 2).item()
+
+        return nmd
+
+
 def main():
     opt = parse_option()
 
@@ -335,7 +377,7 @@ def main():
     tb_logger = SummaryWriter(log_dir=opt.tb_folder, flush_secs=30)
 
     # build data loader
-    train_loader = set_loader(opt)
+    train_loader, source_val_loader, target_val_loader = set_loader(opt)
 
     # build model and criterion
     model, criterion = set_model(opt)
@@ -355,11 +397,15 @@ def main():
         time1 = time.time()
         loss, nmd = train(train_loader, model, criterion, optimizer, epoch, iters, opt)
         time2 = time.time()
-        logger.info(f"epoch {epoch}, total_time {(time2 - time1):.2f}, avg_loss {loss:.3f}, avg_nmd {nmd:.3f}")
+        val_nmd = validate(source_val_loader, target_val_loader, model)
+        time3 = time.time()
+        logger.info(f"epoch {epoch}, train_time {(time2 - time1):.2f}, val_time {(time3 - time2):.2f}, " +
+                    f"avg_loss {loss:.3f}, avg_nmd {nmd:.3f}, val_nmd {val_nmd:.3f}")
 
         # tensorboard logging
         tb_logger.add_scalar('metric/loss', loss, epoch)
         tb_logger.add_scalar('metric/nmd', nmd, epoch)
+        tb_logger.add_scalar('metric/val_nmd', val_nmd, epoch)
         tb_logger.add_scalar('learning_rate', optimizer.param_groups[0]['lr'], epoch)
 
         if epoch % opt.save_freq == 0:
