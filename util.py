@@ -76,7 +76,7 @@ def set_optimizer(opt, model):
     return optimizer
 
 
-def save_model(model, optimizer, opt, epoch, save_file):
+def save_checkpoint(model, optimizer, opt, epoch, save_file):
     opt.logger.info(f'==> Saving... "{save_file}"')
     opt_dict = {k: v for k, v in opt.__dict__.items() if k != "logger"}
     state = {
@@ -105,7 +105,7 @@ def set_up_logger(logs_path, log_file_name=None):
     consoleHandler = logging.StreamHandler()
     logger.addHandler(fileHandler)
     logger.addHandler(consoleHandler)
-    formatter = logging.Formatter("%(asctime)s,%(msecs)03d %(levelname)s        %(message)s", datefmt="%H:%M:%S")
+    formatter = logging.Formatter("%(asctime)s,%(msecs)03d %(levelname).1s   %(message)s", datefmt="%H:%M:%S")
     fileHandler.setFormatter(formatter)
     consoleHandler.setFormatter(formatter)
     logger.setLevel(logging.INFO)

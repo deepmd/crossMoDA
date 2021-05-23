@@ -12,10 +12,9 @@ from monai.data import DataLoader
 from matplotlib import pyplot as plt
 from tqdm import tqdm
 
-from util import AverageMeter
-from util import adjust_learning_rate, warmup_learning_rate
-from util import set_optimizer, save_model
-from util import set_up_logger, log_parameters
+from util import \
+    AverageMeter, adjust_learning_rate, warmup_learning_rate, set_optimizer, save_checkpoint, \
+    set_up_logger, log_parameters
 from networks import get_encoder_model
 from losses import SupConLoss
 from data.dataset import CachePartDataset, CacheSliceDataset
@@ -242,6 +241,7 @@ def train(train_loader, model, criterion, optimizer, epoch, iters, opt):
 
     batch_time = AverageMeter()
     data_time = AverageMeter()
+    partial_losses = {"source": AverageMeter(), "target": AverageMeter(), "cross": AverageMeter()}
     losses = AverageMeter()
     sources = AverageMeter()
     targets = AverageMeter()
@@ -299,6 +299,9 @@ def train(train_loader, model, criterion, optimizer, epoch, iters, opt):
         loss = source_loss + target_loss + cross_loss
 
         # update metric
+        partial_losses["source"].update(source_loss.item(), bsz)
+        partial_losses["target"].update(target_loss.item(), bsz)
+        partial_losses["cross"].update(0 if cross_loss == 0 else cross_loss.item(), bsz)
         losses.update(loss.item(), bsz)
 
         # keeping source and target features avg
@@ -324,11 +327,12 @@ def train(train_loader, model, criterion, optimizer, epoch, iters, opt):
             opt.logger.info(f"Train: [{epoch}][{idx+1}/{len(train_loader)}]\t" +
                 f"BT {batch_time.val:.3f} ({batch_time.avg:.3f})\t" +
                 f"DT {data_time.val:.3f} ({data_time.avg:.3f})\t" +
-                f"loss {losses.val:.3f} ({losses.avg:.3f})\t" +
+                f"loss {losses.val:.3f} <{', '.join(f'{pl.val:.3f}' for pl in partial_losses.values())}> " +
+                f"({losses.avg:.3f} <{', '.join(f'{pl.avg:.3f}' for pl in partial_losses.values())}>)\t" +
                 f"nmd {nmd:.3f} ({nmd_avg:.3f})")
 
     nmd_avg = torch.dist(sources.avg, targets.avg, 2).item()
-    return losses.avg, nmd_avg
+    return losses.avg, {name: pl.avg for name, pl in partial_losses.items()}, nmd_avg
 
 
 def validate(source_val_loader, target_val_loader, model):
@@ -395,15 +399,18 @@ def main():
 
         # train for one epoch
         time1 = time.time()
-        loss, nmd = train(train_loader, model, criterion, optimizer, epoch, iters, opt)
+        loss, partial_losses, nmd = train(train_loader, model, criterion, optimizer, epoch, iters, opt)
         time2 = time.time()
         val_nmd = validate(source_val_loader, target_val_loader, model)
         time3 = time.time()
-        logger.info(f"epoch {epoch}, train_time {(time2 - time1):.2f}, val_time {(time3 - time2):.2f}, " +
-                    f"avg_loss {loss:.3f}, avg_nmd {nmd:.3f}, val_nmd {val_nmd:.3f}")
+        logger.info(f"epoch {epoch},  train_time {(time2 - time1):.2f},  val_time {(time3 - time2):.2f},  " +
+                    f"avg_loss {loss:.3f} <{', '.join(f'{pl:.3f}' for pl in partial_losses.values())}>,  "
+                    f"avg_nmd {nmd:.3f},  val_nmd {val_nmd:.3f}")
 
         # tensorboard logging
-        tb_logger.add_scalar('metric/loss', loss, epoch)
+        tb_logger.add_scalar('loss/total', loss, epoch)
+        for name, p_loss in partial_losses.items():
+            tb_logger.add_scalar(f'loss/{name}', p_loss, epoch)
         tb_logger.add_scalar('metric/nmd', nmd, epoch)
         tb_logger.add_scalar('metric/val_nmd', val_nmd, epoch)
         tb_logger.add_scalar('learning_rate', optimizer.param_groups[0]['lr'], epoch)
@@ -411,12 +418,12 @@ def main():
         if epoch % opt.save_freq == 0:
             save_file = os.path.join(
                 opt.save_folder, 'ckpt_epoch_{epoch}.pth'.format(epoch=epoch))
-            save_model(model, optimizer, opt, epoch, save_file)
+            save_checkpoint(model, optimizer, opt, epoch, save_file)
 
     # save the last model
     save_file = os.path.join(
         opt.save_folder, 'last.pth')
-    save_model(model, optimizer, opt, opt.epochs, save_file)
+    save_checkpoint(model, optimizer, opt, opt.epochs, save_file)
 
 
 if __name__ == '__main__':
