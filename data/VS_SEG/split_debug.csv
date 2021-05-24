@@ -2,6 +2,8 @@ vs_gk_1,T1,training
 vs_gk_2,T1,training
 vs_gk_40,T2,training
 vs_gk_43,T2,training
+vs_gk_165,T1,validation
+vs_gk_167,T1,validation
 vs_gk_185,T2,validation
 vs_gk_187,T2,validation
 vs_gk_201,T2,test

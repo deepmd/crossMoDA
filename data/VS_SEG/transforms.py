@@ -1,19 +1,16 @@
 import numpy as np
-from data.transforms import RandMultiTransformd, RandSampleSlice, Spacing2Dd, AlignCropd
+from data.transforms import RandMultiTransformd, RandSampleSlice, Spacing2Dd, AlignCropd, EndOfCache
 from monai.transforms import \
     Compose, LoadImaged, AddChanneld, NormalizeIntensityd, ScaleIntensityRangePercentilesd, \
     RandFlipd, RandSpatialCropd, RandScaleIntensityd, Orientationd, ToTensord, RandAffined, \
-    RandShiftIntensityd, RandGaussianNoised
+    RandShiftIntensityd, RandGaussianNoised, CenterSpatialCropd
 
 
-def encoder_transforms(opt, domain):
-    if domain == "source":
-        align_roi = _source_align_roi
-    elif domain == "target":
-        align_roi = _target_align_roi
-    else:
-        raise ValueError("Value of domain should be either 'source' or 'target'.")
+_base_pixdim = [0.41015625, 0.41015625]
 
+
+def encoder_train_transforms(opt, domain):
+    align_roi = _get_align_roi(domain)
     # Using device=torch.device("cuda") in RandAffine produces some issues:
     # 1. RandFlip, RandScaleIntensity, RandShiftIntensity, RandGaussianNoise all use numpy and having tensor on CUDA
     #    causes error unless make these transforms precede RandAffine in the list.
@@ -27,11 +24,12 @@ def encoder_transforms(opt, domain):
             LoadImaged(keys=["image"]),
             AddChanneld(keys=["image"]),
             Orientationd(keys=["image"], axcodes="RAS"),
-            Spacing2Dd(keys=["image"], pixdim=[0.41015625, 0.41015625]),
+            Spacing2Dd(keys=["image"], pixdim=_base_pixdim),
             NormalizeIntensityd(keys=["image"]),
             # N4BiasFieldCorrection
             # ScaleIntensityRangePercentilesd(keys=["image"], lower=1, upper=99, b_min=0, b_max=1),
             AlignCropd(keys=["image"], align_roi=align_roi),
+            EndOfCache(),
             RandSampleSlice(keys=["image"]),
             RandMultiTransformd(keys=["image"], times=2, keep_orig=opt.debug, view_transforms=
                 lambda keys: [
@@ -46,6 +44,32 @@ def encoder_transforms(opt, domain):
             ToTensord(keys=["image", "part_num"])
         ]
     )
+
+
+def encoder_val_transforms(opt, domain):
+    align_roi = _get_align_roi(domain)
+    return Compose(
+        [
+            LoadImaged(keys=["image"]),
+            AddChanneld(keys=["image"]),
+            Orientationd(keys=["image"], axcodes="RAS"),
+            Spacing2Dd(keys=["image"], pixdim=_base_pixdim),
+            NormalizeIntensityd(keys=["image"]),
+            AlignCropd(keys=["image"], align_roi=align_roi),
+            EndOfCache(),
+            CenterSpatialCropd(keys=["image"], roi_size=(opt.size, opt.size)),
+            ToTensord(keys=["image"])
+        ]
+    )
+
+
+def _get_align_roi(domain):
+    if domain == "source":
+        return _source_align_roi
+    elif domain == "target":
+        return _target_align_roi
+    else:
+        raise ValueError("Value of domain should be either 'source' or 'target'.")
 
 
 def _source_align_roi(img, meta_dict):

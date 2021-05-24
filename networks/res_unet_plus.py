@@ -1,6 +1,6 @@
 import torch.nn as nn
 import torch
-from modules import (
+from .modules import (
     ResidualConv,
     ASPP,
     AttentionBlock,
@@ -13,8 +13,9 @@ from modules import (
 class ResUnetPlusPlus(nn.Module):
     def __init__(
             self,
-            channel,
-            filters=[32, 64, 128, 256, 512],
+            in_channels=1,
+            out_channels=2,
+            filters=(32, 64, 128, 256, 512),
             use_decoder=True,
             head='mlp',
             feat_dim=128
@@ -27,13 +28,13 @@ class ResUnetPlusPlus(nn.Module):
             self.projection = Projection(head=head, dim_in=filters[-1], feat_dim=feat_dim)
 
         self.input_layer = nn.Sequential(
-            nn.Conv2d(channel, filters[0], kernel_size=3, padding=1),
+            nn.Conv2d(in_channels, filters[0], kernel_size=3, padding=1),
             nn.BatchNorm2d(filters[0]),
             nn.ReLU(),
             nn.Conv2d(filters[0], filters[0], kernel_size=3, padding=1),
         )
         self.input_skip = nn.Sequential(
-            nn.Conv2d(channel, filters[0], kernel_size=3, padding=1)
+            nn.Conv2d(in_channels, filters[0], kernel_size=3, padding=1)
         )
 
         self.squeeze_excite1 = Squeeze_Excite_Block(filters[0])
@@ -70,7 +71,7 @@ class ResUnetPlusPlus(nn.Module):
 
             self.aspp_out = ASPP(filters[1], filters[0])
 
-            self.output_layer = nn.Sequential(nn.Conv2d(filters[0], 1, 1), nn.Sigmoid())
+            self.output_layer = nn.Conv2d(filters[0], out_channels, 1)
 
     def forward(self, x):
         x1 = self.input_layer(x) + self.input_skip(x)
@@ -121,8 +122,9 @@ class ResUnetPlusPlus(nn.Module):
 
 if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = ResUnetPlusPlus(channel=1,
-                            filters=[64, 128, 256, 512, 1024, 2048],
+    model = ResUnetPlusPlus(in_channels=1,
+                            out_channels=2,
+                            filters=(64, 128, 256, 512, 1024, 1024),
                             use_decoder=False,
                             head='mlp',
                             feat_dim=128,
