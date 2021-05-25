@@ -61,12 +61,11 @@ def conv1x1(in_planes, out_planes, stride=1, dilation=1, padding=None):
 
 
 class InputBottleneckBlock(nn.Module):
-    def __init__(self, inplanes, in_filters):
+    def __init__(self, in_planes, out_planes):
         super().__init__()
-        expansion = 4
-        F1, F2, F3 = in_filters, in_filters, in_filters * expansion
-        self.conv_shortcut = conv1x1(inplanes, F3, stride=1)
-        self.conv1 = conv1x1(inplanes, F1, stride=1)
+        F1, F2, F3 = out_planes//4, out_planes//4, out_planes
+        self.conv_shortcut = conv1x1(in_planes, F3, stride=1)
+        self.conv1 = conv1x1(in_planes, F1, stride=1)
         self.bn2 = nn.BatchNorm2d(F1)
         self.conv2 = conv3x3(F1, F2, stride=1)
         self.bn3 = nn.BatchNorm2d(F2)
@@ -94,25 +93,24 @@ class InputBottleneckBlock(nn.Module):
 class BottleneckBlock(nn.Module):
     def __init__(
             self,
-            inplanes,
-            planes,
+            in_planes,
+            out_planes,
             downsample=False,
     ):
         super().__init__()
-        expansion = 4
-        F1, F2, F3 = planes, planes, planes * expansion
+        F1, F2, F3 = out_planes//4, out_planes//4, out_planes
         self.downsample = downsample
         stride = 2 if self.downsample else 1
 
-        self.bn1 = nn.BatchNorm2d(inplanes)
-        self.conv1 = conv1x1(inplanes, F1, stride=stride)
+        self.bn1 = nn.BatchNorm2d(in_planes)
+        self.conv1 = conv1x1(in_planes, F1, stride=stride)
         self.bn2 = nn.BatchNorm2d(F1)
         self.conv2 = conv3x3(F1, F2, stride=1)
         self.bn3 = nn.BatchNorm2d(F2)
         self.conv3 = conv1x1(F2, F3, stride=1)
         self.relu = nn.ReLU(inplace=True)
         if self.downsample:
-            self.conv_shortcut = conv1x1(inplanes, F3, stride=stride)
+            self.conv_shortcut = conv1x1(in_planes, F3, stride=stride)
 
     def forward(self, x):
         x_shortcut = x
@@ -192,14 +190,15 @@ class UpsampleConcatenation(nn.Module):
                                            padding=padding,
                                            output_padding=output_padding)
 
-    def forward(self, x_down, x_skip):
+    def forward(self, x):
+        x_down, x_skip = x
         x_down = self.upsample(x_down)
         x = torch.cat([x_down, x_skip], dim=1)
 
         return x
 
 
-class DR_Unet104(nn.Module):
+class DRUNet104(nn.Module):
     def __init__(self,
                  in_channels,
                  out_channels,
@@ -216,49 +215,47 @@ class DR_Unet104(nn.Module):
         self.use_decoder = use_decoder
         if not self.use_decoder:
             self.projection = Projection(head=head, dim_in=2048, feat_dim=feat_dim)
-        filters = [init_filters * 2 ** i for i in range(len(layers))]
-        # inplanes = [init_filters * 2 ** i for i in range(2, len(layers)+1)]
-        self.input_bottleneck_block = InputBottleneckBlock(in_channels, filters[0])
-        self.bottleneck_block = BottleneckBlock(filters[0]*4, filters[0])
 
-        self.down_layer1 = self._make_down_layer(filters[1]*2, filters[1], layers[1], dropout)
-        self.down_layer2 = self._make_down_layer(filters[2]*2, filters[2], layers[2], dropout)
-        self.down_layer3 = self._make_down_layer(filters[3]*2, filters[3], layers[3], dropout)
-        self.down_layer4 = self._make_down_layer(filters[4]*2, filters[4], layers[4], dropout)
-        self.bridge = self._make_down_layer(filters[5]*2, filters[5], layers[5], dropout)
+        # for init_filters=16: filters = [64, 128, 256, 512, 1024, 2048]
+        filters = [init_filters * 4 * 2 ** i for i in range(len(layers))]
+
+        self.input_bottleneck_block = InputBottleneckBlock(in_channels, filters[0])
+        self.bottleneck_block = BottleneckBlock(filters[0], filters[0])
+
+        self.down_layer1 = self._make_down_layer(filters[0], filters[1], layers[1], dropout)
+        self.down_layer2 = self._make_down_layer(filters[1], filters[2], layers[2], dropout)
+        self.down_layer3 = self._make_down_layer(filters[2], filters[3], layers[3], dropout)
+        self.down_layer4 = self._make_down_layer(filters[3], filters[4], layers[4], dropout)
+        self.bridge = self._make_down_layer(filters[4], filters[5], layers[5], dropout)
 
         if self.use_decoder:
-            # Level 5
-            self.upsample_and_concatenation1 = UpsampleConcatenation(2048, 1024)
-            self.residual_block1 = ResidualBlock(1024+1024, 512)
-
-            # Level 4
-            self.upsample_and_concatenation2 = UpsampleConcatenation(512, 512)
-            self.residual_block2 = ResidualBlock(512+512, 256)
-
-            # Level 3
-            self.upsample_and_concatenation3 = UpsampleConcatenation(256, 256)
-            self.residual_block3 = ResidualBlock(256+256, 128)
-
-            # Level 2
-            self.upsample_and_concatenation4 = UpsampleConcatenation(128, 128)
-            self.residual_block4 = ResidualBlock(128+128, 64)
-
-            # Level 1
-            self.upsample_and_concatenation5 = UpsampleConcatenation(64, 64)
-            self.residual_block5 = ResidualBlock(64+64, 32)
-            self.bn = nn.BatchNorm2d(32)
+            self.up_layer1 = self._make_up_layer(filters[5], filters[4]//2, dropout)
+            self.up_layer2 = self._make_up_layer(filters[4]//2, filters[3]//2, dropout)
+            self.up_layer3 = self._make_up_layer(filters[3]//2, filters[2]//2, dropout)
+            self.up_layer4 = self._make_up_layer(filters[2]//2, filters[1]//2, dropout)
+            self.up_layer5 = self._make_up_layer(filters[1]//2, filters[0]//2, dropout)
+            self.bn = nn.BatchNorm2d(filters[0]//2)
             self.relu = nn.ReLU(inplace=True)
 
             # Output layer
             if self.use_conv_final:
-                self.conv_final = conv1x1(32, out_channels)
+                self.conv_final = conv1x1(filters[0]//2, out_channels)
 
-    def _make_down_layer(self, inplanes, planes, blocks, dropout):
+    def _make_up_layer(self, in_planes, out_planes, dropout):
         layers = list()
-        layers.append(BottleneckBlock(inplanes, planes, downsample=True))
+        layers.append(UpsampleConcatenation(in_planes, out_planes*2))
+        layers.append(ResidualBlock(out_planes*4, out_planes))
+
+        if dropout != 0:
+            layers.append(nn.Dropout(p=dropout))
+
+        return nn.Sequential(*layers)
+
+    def _make_down_layer(self, in_planes, out_planes, blocks, dropout):
+        layers = list()
+        layers.append(BottleneckBlock(in_planes, out_planes, downsample=True))
         for _ in range(1, blocks):
-            layers.append(BottleneckBlock(planes*4, planes, downsample=False))
+            layers.append(BottleneckBlock(out_planes, out_planes, downsample=False))
 
         if dropout != 0:
             layers.append(nn.Dropout(p=dropout))
@@ -269,59 +266,53 @@ class DR_Unet104(nn.Module):
         # Level 1
         e0 = self.input_bottleneck_block(x)
         e0 = self.bottleneck_block(e0)
-        print(e0.size())
+        # print(e0.size())
 
         # Level 2
         e1 = self.down_layer1(e0)
-        print(e1.size())
+        # print(e1.size())
 
         # Level 3
         e2 = self.down_layer2(e1)
-        print(e2.size())
+        # print(e2.size())
 
         # Level 4
         e3 = self.down_layer3(e2)
-        # x4 = self.zero_padding(x4)
-        print(e3.size())
+        # print(e3.size())
 
         # Level 5
         e4 = self.down_layer4(e3)
-        print(e4.size())
+        # print(e4.size())
 
         # Bridge
         e5 = self.bridge(e4)
-        print(e5.size())
+        # print(e5.size())
 
         if not self.use_decoder:
             x = self.projection(e5)
             return x
 
         # Level 5
-        u0 = self.upsample_and_concatenation1(e5, e4)
-        d0 = self.residual_block1(u0)
-        print(d0.size())
+        d0 = self.up_layer1([e5, e4])
+        # print(d0.size())
 
         # Level 4
-        u1 = self.upsample_and_concatenation2(d0, e3)
-        d1 = self.residual_block2(u1)
-        print(d1.size())
+        d1 = self.up_layer2([d0, e3])
+        # print(d1.size())
 
         # Level 3
-        u2 = self.upsample_and_concatenation3(d1, e2)
-        d2 = self.residual_block3(u2)
-        print(d2.size())
+        d2 = self.up_layer3([d1, e2])
+        # print(d2.size())
 
         # Level 2
-        u3 = self.upsample_and_concatenation4(d2, e1)
-        d3 = self.residual_block4(u3)
-        print(d3.size())
+        d3 = self.up_layer4([d2, e1])
+        # print(d3.size())
 
         # Level 1
-        u4 = self.upsample_and_concatenation5(d3, e0)
-        d4 = self.residual_block5(u4)
+        d4 = self.up_layer5([d3, e0])
         x = self.bn(d4)
         x = self.relu(x)
-        print(x.size())
+        # print(x.size())
 
         # Output layer
         if self.use_conv_final:
@@ -332,15 +323,15 @@ class DR_Unet104(nn.Module):
 
 if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = DR_Unet104(in_channels=1,
-                       out_channels=2,
-                       init_filters=16,
-                       layers=[2, 3, 3, 5, 14, 4],
-                       dropout=0.2,
-                       use_decoder=False,
-                       head='mlp',
-                       feat_dim=128,
-                       ).to(device)
+    model = DRUNet104(in_channels=1,
+                      out_channels=2,
+                      init_filters=16,
+                      layers=[2, 3, 3, 5, 14, 4],
+                      dropout=0.2,
+                      use_decoder=False,
+                      head='mlp',
+                      feat_dim=128,
+                      ).to(device)
 
     x = torch.ones([3, 1, 352, 352]).to(device)
     out = model(x)
