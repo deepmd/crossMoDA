@@ -1,10 +1,11 @@
+from itertools import chain
+
 from monai.networks.nets import SegResNet as monaiSegResNet
 from typing import Union, Optional
 from monai.utils import UpsampleMode
-from .modules import Projection
+from .projection import Projection
 
 import torch
-from torch import nn
 
 
 class SegResNet(monaiSegResNet):
@@ -50,7 +51,11 @@ class SegResNet(monaiSegResNet):
             self.conv_final = None
             input_projection_size = pow(2, len(self.down_layers) - 1) * self.init_filters
             self.projection = Projection(head=head, dim_in=input_projection_size, feat_dim=feat_dim)
-        self.encoder = nn.Sequential(self.convInit, *self.down_layers)
+
+    def freeze_encoder(self):
+        encoder_layers = [self.convInit] + self.down_layers
+        for param in chain.from_iterable(layer.parameters() for layer in encoder_layers):
+            param.requires_grad = False
 
     def forward(self, x):
         x = self.convInit(x)

@@ -4,7 +4,7 @@ import torch
 from monai.data.dataset import CacheDataset
 from monai.utils import ensure_tuple
 from monai.config.type_definitions import KeysCollection
-from typing import Callable, List, Optional, Sequence, Union, Tuple
+from typing import Callable, List, Optional, Sequence, Union, Tuple, Dict
 import numpy as np
 from math import ceil
 
@@ -39,7 +39,7 @@ class CachePartDataset(CacheDataset):
                     split_items[key] = np.array_split(item[key], parts_num, axis=-1)
                 else:
                     raise TypeError(f"Cannot split data of type {type(item[key]).__name__}.")
-            split_items['part_num'] = np.arange(parts_num)  # using list(range(parts_num)) make an issue
+            split_items['part_idx'] = np.arange(parts_num)  # list(range(parts_num)) has issues, if used in ToTensord
             if self.copy_other_keys:
                 for other_key in item.keys():
                     if other_key not in self.keys:
@@ -56,6 +56,7 @@ class CacheSliceDataset(CacheDataset):
             data: Sequence,
             transform: Union[Sequence[Callable], Callable],
             keys: KeysCollection,
+            stats_collector: Optional[Callable[[Dict], Dict]] = None,
             num_workers: Optional[int] = None,
             progress: bool = True,
             copy_other_keys: bool = True
@@ -63,6 +64,7 @@ class CacheSliceDataset(CacheDataset):
         super().__init__(data=data, transform=transform, num_workers=num_workers, progress=progress)
         self.keys = ensure_tuple(keys)
         self.copy_other_keys = copy_other_keys
+        self.stats_collector = stats_collector
         self._cache, slices_nums = self._slice_cache(self._cache)
         self.cache_num = len(self._cache)
         self.data = [x for i, x in enumerate(self.data) for _ in range(slices_nums[i])]
@@ -70,19 +72,32 @@ class CacheSliceDataset(CacheDataset):
     def _slice_cache(self, cache: List) -> Tuple[List, List]:
         slice_cache = []
         slices_nums = []
-        for item in cache:
+        for idx, item in enumerate(cache):
+            # collect stats
+            stat_keys = []
+            if self.stats_collector is not None:
+                stats_dict = self.stats_collector(item)
+                for stat_key, stat_value in stats_dict.items():
+                    if stat_key in item:
+                        raise KeyError(f"Key {stat_key} already exists in data.")
+                    item[stat_key] = stat_value
+                    stat_keys.append(stat_key)
+            stat_keys = ensure_tuple(stat_keys)
+            # divide to slices
             slices = dict()
             slices_num = item[self.keys[0]].shape[-1]
-            for key in self.keys:
+            for key in (self.keys + stat_keys):
                 if item[key].shape[-1] != slices_num:
                     raise ValueError(f"Different number of slices exist in key '{key}'.")
                 if isinstance(item[key], torch.Tensor) or isinstance(item[key], np.ndarray):
                     slices[key] = [item[key][..., i] for i in range(slices_num)]
                 else:
-                    raise TypeError(f"Cannot split data of type {type(item[key]).__name__}.")
+                    raise TypeError(f"Cannot divide slices of type {type(item[key]).__name__}.")
+            slices['slice_idx'] = np.arange(slices_num)  # list(range(slices_num)) has issues, if used in ToTensord
+            slices['vol_idx'] = np.repeat(idx, slices_num)  # [idx]*slices_num has issues, if used in ToTensord
             if self.copy_other_keys:
                 for other_key in item.keys():
-                    if other_key not in self.keys:
+                    if other_key not in (self.keys + stat_keys):
                         slices[other_key] = [deepcopy(item[other_key]) for _ in range(slices_num)]
             # "dict of lists" to "list of dicts" {0:[4,5,6], 1:[7,8,9]} --> [{0:4, 1:7}, {0:5, 1:8}, {0:6, 1:9}]
             slices = [{k: v[i] for k, v in slices.items()} for i in range(slices_num)]

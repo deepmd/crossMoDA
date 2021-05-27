@@ -5,7 +5,6 @@ import os
 
 import numpy as np
 import torch
-import torch.optim as optim
 
 
 class AverageMeter(object):
@@ -26,21 +25,10 @@ class AverageMeter(object):
         self.avg = self.sum / self.count
 
 
-def accuracy(output, target, topk=(1,)):
-    """Computes the accuracy over the k top predictions for the specified values of k"""
-    with torch.no_grad():
-        maxk = max(topk)
-        batch_size = target.size(0)
-
-        _, pred = output.topk(maxk, 1, True, True)
-        pred = pred.t()
-        correct = pred.eq(target.view(1, -1).expand_as(pred))
-
-        res = []
-        for k in topk:
-            correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
-            res.append(correct_k.mul_(100.0 / batch_size))
-        return res
+def mean(values):
+    if isinstance(values, dict):
+        values = values.values()
+    return sum(values) / len(values)
 
 
 def adjust_learning_rate(args, optimizer, epoch):
@@ -68,12 +56,14 @@ def warmup_learning_rate(args, epoch, batch_id, total_batches, optimizer):
             param_group['lr'] = lr
 
 
-def set_optimizer(opt, model):
-    optimizer = optim.SGD(model.parameters(),
-                          lr=opt.learning_rate,
-                          momentum=opt.momentum,
-                          weight_decay=opt.weight_decay)
-    return optimizer
+def load_model(model, opt, load_file):
+    opt.logger.info(f'==> Loading... "{load_file}"')
+    ckpt = torch.load(opt.ckpt, map_location='cpu')
+    state_dict = ckpt['model']
+    not_found_keys = [key for key in model.state_dict() if key not in state_dict]
+    model.load_state_dict(state_dict, strict=False)
+    if len(not_found_keys) > 0:
+        opt.logger.warning(f"Missing key(s) in checkpoint file: {not_found_keys}")
 
 
 def save_checkpoint(model, optimizer, opt, epoch, save_file):

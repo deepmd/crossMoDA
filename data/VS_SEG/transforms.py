@@ -1,12 +1,9 @@
 import numpy as np
-from data.transforms import RandMultiTransformd, RandSampleSlice, Spacing2Dd, AlignCropd, EndOfCache
+from data.transforms import RandMultiTransformd, RandSampleSlice, Spacing2Dd, AlignCropd, EndOfCache, KeepOriginald
 from monai.transforms import \
     Compose, LoadImaged, AddChanneld, NormalizeIntensityd, ScaleIntensityRangePercentilesd, \
     RandFlipd, RandSpatialCropd, RandScaleIntensityd, Orientationd, ToTensord, RandAffined, \
     RandShiftIntensityd, RandGaussianNoised, CenterSpatialCropd
-
-
-_base_pixdim = [0.41015625, 0.41015625]
 
 
 def encoder_train_transforms(opt, domain):
@@ -24,24 +21,25 @@ def encoder_train_transforms(opt, domain):
             LoadImaged(keys=["image"]),
             AddChanneld(keys=["image"]),
             Orientationd(keys=["image"], axcodes="RAS"),
-            Spacing2Dd(keys=["image"], pixdim=_base_pixdim),
+            Spacing2Dd(keys=["image"], pixdim=_base_pixdim, mode="bilinear"),
             NormalizeIntensityd(keys=["image"]),
             # N4BiasFieldCorrection
             # ScaleIntensityRangePercentilesd(keys=["image"], lower=1, upper=99, b_min=0, b_max=1),
             AlignCropd(keys=["image"], align_roi=align_roi),
             EndOfCache(),
             RandSampleSlice(keys=["image"]),
-            RandMultiTransformd(keys=["image"], times=2, keep_orig=opt.debug, view_transforms=
+            KeepOriginald(keys=["image"], do_transform=opt.debug),
+            RandMultiTransformd(keys=["image"], times=2, view_transforms=
                 lambda keys: [
-                    RandScaleIntensityd(keys=keys[0], factors=0.1, prob=0.5),  # v = v * (1 + U(-0.1, 0.1))
-                    RandShiftIntensityd(keys=keys[0], offsets=0.1, prob=0.5),  # v = v + U(-0.1, 0.1)
-                    RandGaussianNoised(keys=keys[0], std=0.1, prob=1),  # std=U(0, 0.1) mean=0
+                    RandScaleIntensityd(keys=keys, factors=0.1, prob=0.5),  # v = v * (1 + U(-0.1, 0.1))
+                    RandShiftIntensityd(keys=keys, offsets=0.1, prob=0.5),  # v = v + U(-0.1, 0.1)
+                    RandGaussianNoised(keys=keys, std=0.1, prob=1),  # std=U(0, 0.1) mean=0
                     RandFlipd(keys=keys, spatial_axis=0, prob=0.5),
-                    RandAffined(keys=keys, scale_range=0.1, rotate_range=np.pi/18, prob=1),
+                    RandAffined(keys=keys, scale_range=0.1, rotate_range=np.pi/18, mode="bilinear", prob=1),
                     RandSpatialCropd(keys=keys, roi_size=(opt.size, opt.size), random_center=True, random_size=False)
                 ]
             ),
-            ToTensord(keys=["image", "part_num"])
+            ToTensord(keys=["image"])
         ]
     )
 
@@ -53,14 +51,59 @@ def encoder_val_transforms(opt, domain):
             LoadImaged(keys=["image"]),
             AddChanneld(keys=["image"]),
             Orientationd(keys=["image"], axcodes="RAS"),
-            Spacing2Dd(keys=["image"], pixdim=_base_pixdim),
+            Spacing2Dd(keys=["image"], pixdim=_base_pixdim, mode="bilinear"),
             NormalizeIntensityd(keys=["image"]),
             AlignCropd(keys=["image"], align_roi=align_roi),
             EndOfCache(),
+            KeepOriginald(keys=["image"], do_transform=opt.debug),
             CenterSpatialCropd(keys=["image"], roi_size=(opt.size, opt.size)),
             ToTensord(keys=["image"])
         ]
     )
+
+
+def supervised_train_transforms(opt, domain):
+    align_roi = _get_align_roi(domain)
+    return Compose(
+        [
+            LoadImaged(keys=["image", "label"]),
+            AddChanneld(keys=["image", "label"]),
+            Orientationd(keys=["image", "label"], axcodes="RAS"),
+            Spacing2Dd(keys=["image", "label"], pixdim=_base_pixdim, mode=("bilinear", "nearest")),
+            NormalizeIntensityd(keys=["image"]),
+            AlignCropd(keys=["image", "label"], align_roi=align_roi),
+            EndOfCache(),
+            KeepOriginald(keys=["image"], do_transform=opt.debug),
+            RandScaleIntensityd(keys="image", factors=0.1, prob=0.5),
+            RandShiftIntensityd(keys="image", offsets=0.1, prob=0.5),
+            RandGaussianNoised(keys="image", std=0.1, prob=1),
+            RandFlipd(keys=["image", "label"], spatial_axis=0, prob=0.5),
+            RandAffined(keys=["image", "label"], scale_range=0.1, rotate_range=np.pi/18, mode=("bilinear", "nearest"), prob=1),
+            RandSpatialCropd(keys=["image", "label"], roi_size=(opt.size, opt.size), random_center=True, random_size=False),
+            ToTensord(keys=["image", "label"])
+        ]
+    )
+
+
+def supervised_val_transforms(opt, domain):
+    align_roi = _get_align_roi(domain)
+    return Compose(
+        [
+            LoadImaged(keys=["image", "label"]),
+            AddChanneld(keys=["image", "label"]),
+            Orientationd(keys=["image", "label"], axcodes="RAS"),
+            Spacing2Dd(keys=["image", "label"], pixdim=_base_pixdim, mode=("bilinear", "nearest")),
+            NormalizeIntensityd(keys=["image"]),
+            AlignCropd(keys=["image", "label"], align_roi=align_roi),
+            EndOfCache(),
+            KeepOriginald(keys=["image"], do_transform=opt.debug),
+            CenterSpatialCropd(keys=["image", "label"], roi_size=(opt.size, opt.size)),
+            ToTensord(keys=["image", "label"])
+        ]
+    )
+
+
+_base_pixdim = [0.41015625, 0.41015625]
 
 
 def _get_align_roi(domain):
@@ -102,4 +145,3 @@ def _target_align_roi(img, meta_dict):
     else:
         file_name = meta_dict["filename_or_obj"]
         raise ValueError(f"Unexpected values for dim-z={dim[2]} or pixdim-z={pixdim_z} in file {file_name}.")
-

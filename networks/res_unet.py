@@ -1,12 +1,106 @@
+from itertools import chain
+
 import torch
 import torch.nn as nn
-from .modules import ResidualConv, Upsample, Projection
+from .projection import Projection
 
 
-class ResUnet(nn.Module):
+class PreActivateDoubleConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(PreActivateDoubleConv, self).__init__()
+        self.double_conv = nn.Sequential(
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        )
+
+    def forward(self, x):
+        return self.double_conv(x)
+
+
+class PreActivateResUpBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(PreActivateResUpBlock, self).__init__()
+        self.ch_avg = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, bias=False),
+            nn.BatchNorm2d(out_channels))
+        self.up_sample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.ch_avg = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, bias=False),
+            nn.BatchNorm2d(out_channels))
+        self.double_conv = PreActivateDoubleConv(in_channels, out_channels)
+
+    def forward(self, down_input, skip_input):
+        x = self.up_sample(down_input)
+        x = torch.cat([x, skip_input], dim=1)
+        return self.double_conv(x) + self.ch_avg(x)
+
+
+class PreActivateResBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(PreActivateResBlock, self).__init__()
+        self.ch_avg = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, bias=False),
+            nn.BatchNorm2d(out_channels))
+
+        self.double_conv = PreActivateDoubleConv(in_channels, out_channels)
+        self.down_sample = nn.MaxPool2d(2)
+
+    def forward(self, x):
+        identity = self.ch_avg(x)
+        out = self.double_conv(x)
+        out = out + identity
+        return self.down_sample(out), out
+
+
+class DoubleConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(DoubleConv, self).__init__()
+        self.double_conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.double_conv(x)
+
+
+class DownBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(DownBlock, self).__init__()
+        self.double_conv = DoubleConv(in_channels, out_channels)
+        self.down_sample = nn.MaxPool2d(2)
+
+    def forward(self, x):
+        skip_out = self.double_conv(x)
+        down_out = self.down_sample(skip_out)
+        return down_out, skip_out
+
+
+class UpBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(UpBlock, self).__init__()
+        self.up_sample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.double_conv = DoubleConv(in_channels, out_channels)
+
+    def forward(self, down_input, skip_input):
+        x = self.up_sample(down_input)
+        x = torch.cat([x, skip_input], dim=1)
+        return self.double_conv(x)
+
+
+class ResUNet(nn.Module):
     """
         Based on "Road Extraction by Deep Residual U-Net"
         https://arxiv.org/abs/1711.10684
+        https://github.com/galprz/brain-tumor-segmentation
     """
     def __init__(
             self,
@@ -15,87 +109,66 @@ class ResUnet(nn.Module):
             filters=(64, 128, 256, 512),
             use_decoder=True,
             head='mlp',
-            feat_dim=128):
-        super(ResUnet, self).__init__()
-
+            feat_dim=128,
+            use_conv_final=True,
+    ):
+        super(ResUNet, self).__init__()
+        self.use_conv_final = use_conv_final
         self.use_decoder = use_decoder
-
         if not self.use_decoder:
             self.projection = Projection(head=head, dim_in=filters[-1], feat_dim=feat_dim)
 
-        self.input_layer = nn.Sequential(
-            nn.Conv2d(in_channels, filters[0], kernel_size=3, padding=1),
-            nn.BatchNorm2d(filters[0]),
-            nn.ReLU(),
-            nn.Conv2d(filters[0], filters[0], kernel_size=3, padding=1),
-        )
-        self.input_skip = nn.Sequential(
-            nn.Conv2d(in_channels, filters[0], kernel_size=3, padding=1)
-        )
+        self.down_conv1 = PreActivateResBlock(in_channels, filters[0])
+        self.down_conv2 = PreActivateResBlock(filters[0], filters[1])
+        self.down_conv3 = PreActivateResBlock(filters[1], filters[2])
+        self.down_conv4 = PreActivateResBlock(filters[2], filters[3])
 
-        self.residual_conv_1 = ResidualConv(filters[0], filters[1], 2, 1)
-        self.residual_conv_2 = ResidualConv(filters[1], filters[2], 2, 1)
-        self.residual_conv_3 = ResidualConv(filters[2], filters[3], 2, 1)
-
-        self.bridge = ResidualConv(filters[3], filters[4], 2, 1)
+        self.double_conv = PreActivateDoubleConv(filters[3], filters[4])
 
         if self.use_decoder:
-            self.upsample_1 = Upsample(filters[4], filters[4], 2, 2)
-            self.up_residual_conv1 = ResidualConv(filters[4] + filters[3], filters[3], 1, 1)
+            self.up_conv4 = PreActivateResUpBlock(filters[3] + filters[4], filters[3])
+            self.up_conv3 = PreActivateResUpBlock(filters[2] + filters[3], filters[2])
+            self.up_conv2 = PreActivateResUpBlock(filters[1] + filters[2], filters[1])
+            self.up_conv1 = PreActivateResUpBlock(filters[1] + filters[0], filters[0])
 
-            self.upsample_2 = Upsample(filters[3], filters[3], 2, 2)
-            self.up_residual_conv2 = ResidualConv(filters[3] + filters[2], filters[2], 1, 1)
+            if self.use_conv_final:
+                self.conv_last = nn.Conv2d(filters[0], out_channels, kernel_size=1)
 
-            self.upsample_3 = Upsample(filters[2], filters[2], 2, 2)
-            self.up_residual_conv3 = ResidualConv(filters[2] + filters[1], filters[1], 1, 1)
-
-            self.upsample_4 = Upsample(filters[1], filters[1], 2, 2)
-            self.up_residual_conv4 = ResidualConv(filters[1] + filters[0], filters[0], 1, 1)
-
-            self.output_layer = nn.Conv2d(filters[1], out_channels, 1, 1)
+    def freeze_encoder(self):
+        encoder_layers = [self.down_conv1, self.down_conv2, self.down_conv3, self.down_conv4, self.double_conv]
+        for param in chain.from_iterable(layer.parameters() for layer in encoder_layers):
+            param.requires_grad = False
 
     def forward(self, x):
-        # Encode
-        x1 = self.input_layer(x) + self.input_skip(x)
-        x2 = self.residual_conv_1(x1)
-        x3 = self.residual_conv_2(x2)
-        x4 = self.residual_conv_3(x3)
-        # Bridge
-        x5 = self.bridge(x4)
+        x, skip1_out = self.down_conv1(x)
+        x, skip2_out = self.down_conv2(x)
+        x, skip3_out = self.down_conv3(x)
+        x, skip4_out = self.down_conv4(x)
+        x = self.double_conv(x)
 
         if not self.use_decoder:
-            x = self.projection(x5)
+            x = self.projection(x)
             return x
 
-        # Decode
-        x5 = self.upsample_1(x5)
-        x6 = torch.cat([x5, x4], dim=1)
+        x = self.up_conv4(x, skip4_out)
+        x = self.up_conv3(x, skip3_out)
+        x = self.up_conv2(x, skip2_out)
+        x = self.up_conv1(x, skip1_out)
 
-        x7 = self.up_residual_conv1(x6)
-
-        x7 = self.upsample_2(x7)
-        x8 = torch.cat([x7, x3], dim=1)
-
-        x9 = self.up_residual_conv2(x8)
-
-        x9 = self.upsample_3(x9)
-        x10 = torch.cat([x9, x2], dim=1)
-
-        x11 = self.up_residual_conv3(x10)
-
-        output = self.output_layer(x11)
-
-        return output
+        if self.use_conv_final:
+            x = self.conv_last(x)
+        return x
 
 
 if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = ResUnet(in_channels=1,
+    model = ResUNet(in_channels=1,
                     out_channels=2,
                     filters=(64, 128, 256, 512, 1024),
-                    use_decoder=False,
+                    use_decoder=True,
                     head='mlp',
                     feat_dim=128,
+                    use_conv_final=True
                     ).to(device)
 
     x = torch.ones([3, 1, 352, 352]).to(device)

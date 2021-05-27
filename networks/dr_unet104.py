@@ -1,6 +1,8 @@
+from itertools import chain
+
 import torch
 from torch import nn
-from modules import Projection
+from .projection import Projection
 from typing import Union, Sequence, Tuple
 import numpy as np
 
@@ -261,6 +263,12 @@ class DRUNet104(nn.Module):
             layers.append(nn.Dropout(p=dropout))
 
         return nn.Sequential(*layers)
+
+    def freeze_encoder(self):
+        encoder_layers = [self.input_bottleneck_block, self.bottleneck_block, self.down_layer1, self.down_layer2,
+                          self.down_layer3, self.down_layer4, self.bridge]
+        for param in chain.from_iterable(layer.parameters() for layer in encoder_layers):
+            param.requires_grad = False
 
     def forward(self, x):
         # Level 1

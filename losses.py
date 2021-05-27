@@ -4,8 +4,14 @@ Date: May 07, 2020
 """
 from __future__ import print_function
 
+import warnings
+from typing import Optional, Callable, Union
+
 import torch
 import torch.nn as nn
+from monai.networks import one_hot
+from monai.utils import LossReduction
+from torch.nn.modules.loss import _Loss
 
 
 class SupConLoss(nn.Module):
@@ -96,3 +102,155 @@ class SupConLoss(nn.Module):
         loss = loss.view(anchor_count, batch_size).mean()   ## view() has no effect bc we mean over all values
 
         return loss
+
+
+class HardnessWeightedDiceLoss(_Loss):
+    """
+        Based on "Automatic Segmentation of Vestibular Schwannoma from T2-Weighted MRI by Deep Spatial Attention with Hardness-Weighted Loss"
+        https://arxiv.org/abs/1906.03906
+        https://github.com/KCL-BMEIS/VS_Seg
+    """
+    def __init__(
+        self,
+        include_background: bool = True,
+        to_onehot_y: bool = False,
+        sigmoid: bool = False,
+        softmax: bool = False,
+        other_act: Optional[Callable] = None,
+        squared_pred: bool = False,
+        jaccard: bool = False,
+        hardness_lambda=0,
+        reduction: Union[LossReduction, str] = LossReduction.MEAN,
+    ) -> None:
+        """
+        Args:
+            include_background: if False channel index 0 (background category) is excluded from the calculation.
+            to_onehot_y: whether to convert `y` into the one-hot format. Defaults to False.
+            sigmoid: if True, apply a sigmoid function to the prediction.
+            softmax: if True, apply a softmax function to the prediction.
+            other_act: if don't want to use `sigmoid` or `softmax`, use other callable function to execute
+                other activation layers, Defaults to ``None``. for example:
+                `other_act = torch.tanh`.
+            squared_pred: use squared versions of targets and predictions in the denominator or not.
+            jaccard: compute Jaccard Index (soft IoU) instead of dice or not.
+            hardness_lambda: !!!!!!!
+            reduction: {``"none"``, ``"mean"``, ``"sum"``}
+                Specifies the reduction to apply to the output. Defaults to ``"mean"``.
+
+                - ``"none"``: no reduction will be applied.
+                - ``"mean"``: the sum of the output will be divided by the number of elements in the output.
+                - ``"sum"``: the output will be summed.
+
+        Raises:
+            TypeError: When ``other_act`` is not an ``Optional[Callable]``.
+            ValueError: When more than 1 of [``sigmoid=True``, ``softmax=True``, ``other_act is not None``].
+                Incompatible values.
+
+        """
+        super().__init__(reduction=LossReduction(reduction).value)
+        if other_act is not None and not callable(other_act):
+            raise TypeError(f"other_act must be None or callable but is {type(other_act).__name__}.")
+        if int(sigmoid) + int(softmax) + int(other_act is not None) > 1:
+            raise ValueError("Incompatible values: more than 1 of [sigmoid=True, softmax=True, other_act is not None].")
+        self.include_background = include_background
+        self.to_onehot_y = to_onehot_y
+        self.sigmoid = sigmoid
+        self.softmax = softmax
+        self.other_act = other_act
+        self.squared_pred = squared_pred
+        self.jaccard = jaccard
+        self.hardness_lambda = hardness_lambda
+
+    def forward(self, input: torch.Tensor, target: torch.Tensor, smooth: float = 1e-5) -> torch.Tensor:
+        """
+        Args:
+            input: the shape should be BNH[WD].
+            target: the shape should be BNH[WD].
+            smooth: a small constant to avoid nan.
+
+        Raises:
+            ValueError: When ``self.reduction`` is not one of ["mean", "sum", "none"].
+
+        """
+        if self.sigmoid:
+            input = torch.sigmoid(input)
+
+        n_pred_ch = input.shape[1]
+        if self.softmax:
+            if n_pred_ch == 1:
+                warnings.warn("single channel prediction, `softmax=True` ignored.")
+            else:
+                input = torch.softmax(input, dim=1)
+
+        if self.other_act is not None:
+            input = self.other_act(input)
+
+        if self.to_onehot_y:
+            if n_pred_ch == 1:
+                warnings.warn("single channel prediction, `to_onehot_y=True` ignored.")
+            else:
+                target = one_hot(target, num_classes=n_pred_ch)
+
+        if not self.include_background:
+            if n_pred_ch == 1:
+                warnings.warn("single channel prediction, `include_background=False` ignored.")
+            else:
+                # if skipping background, removing first channel
+                target = target[:, 1:]
+                input = input[:, 1:]
+
+        assert (
+            target.shape == input.shape
+        ), f"ground truth has differing shape ({target.shape}) from input ({input.shape})"
+
+        # calculating hardness weights
+        hardness_weight = None
+        if self.hardness_lambda > 0:
+            hardness_weight = self.hardness_lambda * abs(input - target) + (1.0 - self.hardness_lambda)
+            # weight = hardness_weight.cpu().detach().numpy()
+            # input_ = input.cpu().detach().numpy()
+            # target_ = target.cpu().detach().numpy()
+            # import matplotlib.pyplot as plt
+            # fig, axs = plt.subplots(1, 3)
+            # axs[0].imshow(input_[1, 1, :, :], cmap='gray')
+            # axs[1].imshow(target_[1, 1, :, :])
+            # axs[2].imshow(weight[1, 1, :, :])
+            # plt.show()
+            # pass
+
+        # reducing only spatial dimensions (not batch nor channels)
+        reduce_axis = list(range(2, len(input.shape)))
+
+        if hardness_weight is not None:
+            intersection = torch.sum(hardness_weight * target * input, dim=reduce_axis)
+        else:
+            intersection = torch.sum(target * input, dim=reduce_axis)
+
+        if self.squared_pred:
+            target = torch.pow(target, 2)
+            input = torch.pow(input, 2)
+
+        if hardness_weight is not None:
+            ground_o = torch.sum(hardness_weight * target, dim=reduce_axis)
+            pred_o = torch.sum(hardness_weight * input, dim=reduce_axis)
+        else:
+            ground_o = torch.sum(target, dim=reduce_axis)
+            pred_o = torch.sum(input, dim=reduce_axis)
+
+        denominator = ground_o + pred_o
+
+        if self.jaccard:
+            denominator = 2.0 * (denominator - intersection)
+
+        f = 1.0 - (2.0 * intersection + smooth) / (denominator + smooth)
+
+        if self.reduction == LossReduction.MEAN.value:
+            f = torch.mean(f)  # the batch and channel average
+        elif self.reduction == LossReduction.SUM.value:
+            f = torch.sum(f)  # sum over the batch and channel dims
+        elif self.reduction == LossReduction.NONE.value:
+            pass  # returns [N, n_classes] losses
+        else:
+            raise ValueError(f'Unsupported reduction: {self.reduction}, available options are ["mean", "sum", "none"].')
+
+        return f

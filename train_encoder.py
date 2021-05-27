@@ -1,11 +1,13 @@
 import os
 import argparse
+import sys
 import time
 import math
 
 import monai
 import torch
 import torch.backends.cudnn as cudnn
+from torch import optim
 from torch.utils.data import ConcatDataset
 from torch.utils.tensorboard import SummaryWriter
 from monai.data import DataLoader
@@ -13,13 +15,12 @@ from matplotlib import pyplot as plt
 from tqdm import tqdm
 
 from util import \
-    AverageMeter, adjust_learning_rate, warmup_learning_rate, set_optimizer, save_checkpoint, \
-    set_up_logger, log_parameters
-from networks import get_encoder_model
+    AverageMeter, adjust_learning_rate, warmup_learning_rate, save_checkpoint, set_up_logger, log_parameters
+from networks import get_model
 from losses import SupConLoss
 from data.dataset import CachePartDataset, CacheSliceDataset
 from data.sampler import MultiDomainBatchSampler
-from data.VS_SEG import get_encoder_train_transforms, get_encoder_val_transforms, get_data
+from data.VS_SEG import get_encoder_train_transforms, get_encoder_val_transforms, get_data, data_cfg
 
 
 def parse_option():
@@ -58,7 +59,7 @@ def parse_option():
 
     # model dataset
     parser.add_argument('--model', type=str,
-                        choices=['SegResNet', 'ResUNet', 'ResUNet++'])
+                        choices=['SegResNet', 'ResUNet', 'ResUNet++', "DR-UNet104"])
     parser.add_argument('--dataset', type=str, default='VS_SEG',
                         choices=['VS_SEG', 'crossMoDA'], help='dataset')
     parser.add_argument("--split", type=str, default="split.csv",
@@ -82,19 +83,22 @@ def parse_option():
 
     opt = parser.parse_args()
 
-    # set the path according to the environment
     if opt.data_folder is None:
         opt.data_folder = './datasets/'
 
     if opt.batch_parts is None:
         opt.batch_parts = opt.n_parts
 
+    opt.in_channels = data_cfg["input_channels"]
+    opt.classes_num = data_cfg["classes_num"]
+    opt.classes = data_cfg["classes"]
+
     iterations = opt.lr_decay_epochs.split(',')
     opt.lr_decay_epochs = list([])
     for it in iterations:
         opt.lr_decay_epochs.append(int(it))
 
-    opt.model_name = f"{opt.dataset}_enc_{opt.model}_prts_{opt.n_parts}_lr_{opt.learning_rate}_decay_{opt.weight_decay}_" + \
+    opt.model_name = f"{opt.dataset}_enc_{opt.model}_SGD_prts_{opt.n_parts}_lr_{opt.learning_rate}_decay_{opt.weight_decay}_" + \
                      f"bsz_{opt.batch_size}_bprts_{opt.batch_parts}_temp_{opt.temp}_indom_{opt.in_domain}"
 
     if opt.cosine:
@@ -142,8 +146,10 @@ def set_loader(opt):
     if len(source_train_data) != len(target_train_data):
         raise ValueError(f"Length of source domain train data {(len(source_train_data))} is not equal to "
                          f"the length of target domain train data ({len(target_train_data)}).")
+    opt.logger.info("Caching source training data ...")
     source_train_dataset = CachePartDataset(data=source_train_data, transform=source_train_transform,
                                             parts_num=opt.n_parts, keys=["image"], num_workers=opt.num_workers)
+    opt.logger.info("Caching target training data ...")
     target_train_dataset = CachePartDataset(data=target_train_data, transform=target_train_transform,
                                             parts_num=opt.n_parts, keys=["image"], num_workers=opt.num_workers)
     train_dataset = ConcatDataset([source_train_dataset, target_train_dataset])
@@ -159,26 +165,28 @@ def set_loader(opt):
         pin_memory=True)
 
     # validation data
+    opt.logger.info("Caching source validation data ...")
     source_val_dataset = CacheSliceDataset(data=source_val_data, transform=source_val_transform,
                                            keys=["image"], num_workers=opt.num_workers)
+    opt.logger.info("Caching target validation data ...")
     target_val_dataset = CacheSliceDataset(data=target_val_data, transform=target_val_transform,
                                            keys=["image"], num_workers=opt.num_workers)
     source_val_loader = DataLoader(
         dataset=source_val_dataset,
         batch_size=math.ceil(opt.batch_size//2),
-        num_workers=opt.num_workers//3,
+        num_workers=opt.num_workers,
         pin_memory=True)
     target_val_loader = DataLoader(
         dataset=target_val_dataset,
         batch_size=math.ceil(opt.batch_size//2),
-        num_workers=opt.num_workers//3,
+        num_workers=opt.num_workers,
         pin_memory=True)
 
     return train_loader, source_val_loader, target_val_loader
 
 
 def set_model(opt):
-    model = get_encoder_model(opt)
+    model = get_model(opt, mode="encoder+projection")
     criterion = SupConLoss(temperature=opt.temp)
 
     # enable synchronized Batch Normalization
@@ -192,56 +200,91 @@ def set_model(opt):
         criterion = criterion.cuda()
         cudnn.benchmark = True
 
-    return model, criterion
+    optimizer = optim.SGD(model.parameters(),
+                          lr=opt.learning_rate,
+                          momentum=opt.momentum,
+                          weight_decay=opt.weight_decay)
+
+    return model, criterion, optimizer
 
 
-def check_data(train_loader, opt):
+def check_train_data(train_loader, opt, max_samples=None):
     logger = opt.logger
-    samples_path = os.path.join(opt.log_folder, "samples")
+    samples_path = os.path.join(opt.log_folder, "train_samples")
     if not os.path.isdir(samples_path):
         os.makedirs(samples_path)
-    first_batch = True
-    logger.info("-" * 10)
-    logger.info("Summary of the training data")
-    logger.info(f"number of volumes    = {len(train_loader.dataset)}")
+    logger.info("Summary of the train data:")
+    logger.info(f"number of partitions = {len(train_loader.dataset)}")
     logger.info(f"number of batches    = {len(train_loader)}")
-    for idx, batch_data in enumerate(tqdm(train_loader, desc="Saving sampled data"), start=1):
-        if first_batch:
-            logger.info(f"data keys            = {list(batch_data.keys())}")
-            image_orig = batch_data["image_orig"][0]
-            image_views = tuple(batch_data["image"][0, :, ...])
-            logger.info(f"original image shape = {tuple(image_orig.shape)}")
-            logger.info(f"image views shapes   = {[tuple(v.shape) for v in image_views]}")
-            first_batch = False
+    logger.info(f"Saving sample data to {samples_path}")
+    max_samples = len(train_loader.dataset) if max_samples is None else max_samples
+    samples_num = 0
+    for idx, batch_data in enumerate(tqdm(train_loader, desc="Saving  samples"), start=1):
         total_bsz = batch_data["image"].shape[0]
         domain_bsz = batch_data["image"].shape[0] // 2
         for i in range(total_bsz):
+            samples_num += 1
+            if samples_num > max_samples:
+                continue
             domain = ("source", "target")[i//domain_bsz]
             image_orig = batch_data["image_orig"][i, 0, ...]
             image_views = tuple(batch_data["image"][i, :, 0, ...])
-            part_num = batch_data["part_num"][i]
+            part_idx = batch_data["part_idx"][i].item()
             file_name = batch_data["image_meta_dict"]["filename_or_obj"][i]
             cols = len(image_views)+1
             fig = plt.figure("check", (cols*6, 6))
-            fig.suptitle(f"Batch:{idx}  Item:{i+1}({domain})  Part:{part_num.item()+1}  File:{file_name}", fontsize=16)
+            fig.suptitle(f"Batch:{idx}  Item:{i+1}({domain})  Part:{part_idx+1}  File:{file_name}", fontsize=16)
             plt.subplot(1, cols, 1)
-            plt.title("Original Image")
+            plt.title(f"Original Image {tuple(image_orig.shape)}")
             plt.imshow(image_orig, cmap="gray", interpolation="none")
             for v_idx, image_view in enumerate(image_views, start=1):
                 plt.subplot(1, cols, v_idx+1)
-                plt.title(f"View_{v_idx}")
-                plt.imshow(image_view.cpu(), cmap="gray", interpolation="none")
-            plt.savefig(os.path.join(samples_path, f"batch_{idx}_item_{i+1}_{domain}_part_{part_num.item()+1}.png"))
-    logger.info("-" * 10)
+                plt.title(f"View_{v_idx} {tuple(image_view.shape)}")
+                plt.imshow(image_view, cmap="gray", interpolation="none")  # cpu() needed if Affine transform device set to cuda
+            plt.savefig(os.path.join(samples_path, f"batch_{idx}_item_{i+1}_{domain}_part_{part_idx+1}.png"))
 
 
-def train(train_loader, model, criterion, optimizer, epoch, iters, opt):
+def check_val_data(data_loader, opt, name, max_samples=None):
+    logger = opt.logger
+    samples_path = os.path.join(opt.log_folder, f"{name}_samples")
+    if not os.path.isdir(samples_path):
+        os.makedirs(samples_path)
+    logger.info(f"Summary of the {name} data:")
+    logger.info(f"number of slices    = {len(data_loader.dataset)}")
+    logger.info(f"number of batches   = {len(data_loader)}")
+    logger.info(f"Saving sample data to {samples_path}")
+    max_samples = len(data_loader.dataset) if max_samples is None else max_samples
+    samples_num = 0
+    for idx, batch_data in enumerate(tqdm(data_loader, desc="Saving  samples"), start=1):
+        bsz = batch_data["image"].shape[0]
+        for i in range(bsz):
+            samples_num += 1
+            if samples_num > max_samples:
+                continue
+            image_orig = batch_data["image_orig"][i, 0, ...]
+            image = batch_data["image"][i, 0, ...]
+            vol_idx = batch_data["vol_idx"][i].item()
+            slice_idx = batch_data["slice_idx"][i].item()
+            file_name = batch_data["image_meta_dict"]["filename_or_obj"][i]
+            fig = plt.figure("check", (2*6, 6))
+            fig.suptitle(f"Batch:{idx}  Item:{i+1}  Volume:{vol_idx+1} Slice:{slice_idx+1}  "
+                         f"File:{file_name}", fontsize=16)
+            plt.subplot(1, 2, 1)
+            plt.title(f"Original Image {tuple(image_orig.shape)}")
+            plt.imshow(image_orig, cmap="gray", interpolation="none")
+            plt.subplot(1, 2, 2)
+            plt.title(f"Image {tuple(image.shape)}")
+            plt.imshow(image, cmap="gray", interpolation="none")
+            plt.savefig(os.path.join(samples_path, f"batch_{idx}_item_{i+1}_vol_{vol_idx+1}_slice_{slice_idx+1}.png"))
+
+
+def train(train_loader, model, criterion, optimizer, epoch, opt):
     """one epoch training"""
     model.train()
 
     batch_time = AverageMeter()
     data_time = AverageMeter()
-    partial_losses = {"source": AverageMeter(), "target": AverageMeter(), "cross": AverageMeter()}
+    partial_losses = AverageMeter()
     losses = AverageMeter()
     sources = AverageMeter()
     targets = AverageMeter()
@@ -249,13 +292,12 @@ def train(train_loader, model, criterion, optimizer, epoch, iters, opt):
     end = time.time()
     for idx, batch_data in enumerate(train_loader):
         data_time.update(time.time() - end)
-        iters[0] += 1
 
         bsz = batch_data["image"].shape[0] // 2
         source_images = batch_data["image"][:bsz]
-        source_labels = batch_data["part_num"][:bsz]
+        source_labels = batch_data["part_idx"][:bsz]
         target_images = batch_data["image"][bsz:]
-        target_labels = batch_data["part_num"][bsz:]
+        target_labels = batch_data["part_idx"][bsz:]
 
         if torch.cuda.is_available():
             source_images = source_images.cuda(non_blocking=True)
@@ -293,22 +335,21 @@ def train(train_loader, model, criterion, optimizer, epoch, iters, opt):
             mask_all[bsz:, bsz:] -= mask_target
             cross_loss = criterion(all_features, mask=mask_all)
         else:
-            cross_loss = 0
+            cross_loss = torch.tensor(0).to(source_loss.device)
 
         # total loss
         loss = source_loss + target_loss + cross_loss
 
         # update metric
-        partial_losses["source"].update(source_loss.item(), bsz)
-        partial_losses["target"].update(target_loss.item(), bsz)
-        partial_losses["cross"].update(0 if cross_loss == 0 else cross_loss.item(), bsz)
+        partial_losses.update(torch.stack([source_loss, target_loss, cross_loss], dim=0), bsz)
         losses.update(loss.item(), bsz)
 
         # keeping source and target features avg
-        mean_source = torch.mean(source_features[:, 0, ...], dim=0)
-        sources.update(mean_source, bsz)
-        mean_target = torch.mean(target_features[:, 0, ...], dim=0)
-        targets.update(mean_target, bsz)
+        with torch.no_grad():
+            mean_source = torch.mean(source_features[:, 0, ...], dim=0)
+            sources.update(mean_source, bsz)
+            mean_target = torch.mean(target_features[:, 0, ...], dim=0)
+            targets.update(mean_target, bsz)
 
         # SGD
         optimizer.zero_grad()
@@ -324,15 +365,15 @@ def train(train_loader, model, criterion, optimizer, epoch, iters, opt):
             # calculate current and average Normalized Mean Distance
             nmd = torch.dist(mean_source, mean_target, 2).item()
             nmd_avg = torch.dist(sources.avg, targets.avg, 2).item()
-            opt.logger.info(f"Train: [{epoch}][{idx+1}/{len(train_loader)}]\t" +
+            opt.logger.info(f"[{epoch}][{idx+1}/{len(train_loader)}]\t" +
                 f"BT {batch_time.val:.3f} ({batch_time.avg:.3f})\t" +
                 f"DT {data_time.val:.3f} ({data_time.avg:.3f})\t" +
-                f"loss {losses.val:.3f} <{', '.join(f'{pl.val:.3f}' for pl in partial_losses.values())}> " +
-                f"({losses.avg:.3f} <{', '.join(f'{pl.avg:.3f}' for pl in partial_losses.values())}>)\t" +
-                f"nmd {nmd:.3f} ({nmd_avg:.3f})")
+                f"Loss {losses.val:06.3f} <{', '.join(f'{pl.item():.3f}' for pl in partial_losses.val)}> " +
+                f"({losses.avg:06.3f} <{', '.join(f'{pl.item():.3f}' for pl in partial_losses.avg)}>)\t" +
+                f"NMD {nmd:.3f} ({nmd_avg:.3f})")
 
     nmd_avg = torch.dist(sources.avg, targets.avg, 2).item()
-    return losses.avg, {name: pl.avg for name, pl in partial_losses.items()}, nmd_avg
+    return losses.avg, {name: pl.item() for name, pl in zip(["source", "target", "cross"], partial_losses.avg)}, nmd_avg
 
 
 def validate(source_val_loader, target_val_loader, model):
@@ -383,29 +424,27 @@ def main():
     # build data loader
     train_loader, source_val_loader, target_val_loader = set_loader(opt)
 
-    # build model and criterion
-    model, criterion = set_model(opt)
-
-    # build optimizer
-    optimizer = set_optimizer(opt, model)
+    # build model, criterion and optimizer
+    model, criterion, optimizer = set_model(opt)
 
     if opt.debug:
-        check_data(train_loader, opt)
+        check_train_data(train_loader, opt, max_samples=200)
+        check_val_data(source_val_loader, opt, "source_val", max_samples=30)
+        check_val_data(target_val_loader, opt, "target_val", max_samples=30)
 
-    iters = [0]
     # training routine
     for epoch in range(1, opt.epochs + 1):
         adjust_learning_rate(opt, optimizer, epoch)
 
         # train for one epoch
         time1 = time.time()
-        loss, partial_losses, nmd = train(train_loader, model, criterion, optimizer, epoch, iters, opt)
+        loss, partial_losses, nmd = train(train_loader, model, criterion, optimizer, epoch, opt)
         time2 = time.time()
         val_nmd = validate(source_val_loader, target_val_loader, model)
         time3 = time.time()
-        logger.info(f"epoch {epoch},  train_time {(time2 - time1):.2f},  val_time {(time3 - time2):.2f},  " +
-                    f"avg_loss {loss:.3f} <{', '.join(f'{pl:.3f}' for pl in partial_losses.values())}>,  "
-                    f"avg_nmd {nmd:.3f},  val_nmd {val_nmd:.3f}")
+        logger.info(f"Epoch {epoch}  Train: Time {(time2 - time1):.2f},  " +
+                    f"Loss {loss:.3f} <{', '.join(f'{pl:.3f}' for pl in partial_losses.values())}>,  NMD {nmd:.3f}")
+        logger.info(f"{' '*(len(str(epoch))+1)}  Validation: Time {(time3 - time2):.2f},  NMD {val_nmd:.3f}")
 
         # tensorboard logging
         tb_logger.add_scalar('loss/total', loss, epoch)

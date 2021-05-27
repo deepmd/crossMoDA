@@ -1,16 +1,141 @@
+from itertools import chain
+
 import torch.nn as nn
 import torch
-from .modules import (
-    ResidualConv,
-    ASPP,
-    AttentionBlock,
-    Upsample_,
-    Squeeze_Excite_Block,
-    Projection,
-)
+from .projection import Projection
 
 
-class ResUnetPlusPlus(nn.Module):
+class ResidualConv(nn.Module):
+    def __init__(self, input_dim, output_dim, stride, padding):
+        super(ResidualConv, self).__init__()
+
+        self.conv_block = nn.Sequential(
+            nn.BatchNorm2d(input_dim),
+            nn.ReLU(),
+            nn.Conv2d(
+                input_dim, output_dim, kernel_size=3, stride=stride, padding=padding
+            ),
+            nn.BatchNorm2d(output_dim),
+            nn.ReLU(),
+            nn.Conv2d(output_dim, output_dim, kernel_size=3, padding=1),
+        )
+        self.conv_skip = nn.Sequential(
+            nn.Conv2d(input_dim, output_dim, kernel_size=3, stride=stride, padding=1),
+            nn.BatchNorm2d(output_dim),
+        )
+
+    def forward(self, x):
+
+        return self.conv_block(x) + self.conv_skip(x)
+
+
+class Squeeze_Excite_Block(nn.Module):
+    def __init__(self, channel, reduction=16):
+        super(Squeeze_Excite_Block, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+
+class ASPP(nn.Module):
+    def __init__(self, in_dims, out_dims, rate=[6, 12, 18]):
+        super(ASPP, self).__init__()
+
+        self.aspp_block1 = nn.Sequential(
+            nn.Conv2d(
+                in_dims, out_dims, 3, stride=1, padding=rate[0], dilation=rate[0]
+            ),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm2d(out_dims),
+        )
+        self.aspp_block2 = nn.Sequential(
+            nn.Conv2d(
+                in_dims, out_dims, 3, stride=1, padding=rate[1], dilation=rate[1]
+            ),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm2d(out_dims),
+        )
+        self.aspp_block3 = nn.Sequential(
+            nn.Conv2d(
+                in_dims, out_dims, 3, stride=1, padding=rate[2], dilation=rate[2]
+            ),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm2d(out_dims),
+        )
+
+        self.output = nn.Conv2d(len(rate) * out_dims, out_dims, 1)
+        self._init_weights()
+
+    def forward(self, x):
+        x1 = self.aspp_block1(x)
+        x2 = self.aspp_block2(x)
+        x3 = self.aspp_block3(x)
+        out = torch.cat([x1, x2, x3], dim=1)
+        return self.output(out)
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight)
+            elif isinstance(m, nn.BatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+
+
+class Upsample(nn.Module):
+    def __init__(self, scale=2):
+        super(Upsample, self).__init__()
+
+        self.upsample = nn.Upsample(mode="bilinear", scale_factor=scale, align_corners=True)
+
+    def forward(self, x):
+        return self.upsample(x)
+
+
+class AttentionBlock(nn.Module):
+    def __init__(self, input_encoder, input_decoder, output_dim):
+        super(AttentionBlock, self).__init__()
+
+        self.conv_encoder = nn.Sequential(
+            nn.BatchNorm2d(input_encoder),
+            nn.ReLU(),
+            nn.Conv2d(input_encoder, output_dim, 3, padding=1),
+            nn.MaxPool2d(2, 2),
+        )
+
+        self.conv_decoder = nn.Sequential(
+            nn.BatchNorm2d(input_decoder),
+            nn.ReLU(),
+            nn.Conv2d(input_decoder, output_dim, 3, padding=1),
+        )
+
+        self.conv_attn = nn.Sequential(
+            nn.BatchNorm2d(output_dim),
+            nn.ReLU(),
+            nn.Conv2d(output_dim, 1, 1),
+        )
+
+    def forward(self, x1, x2):
+        out = self.conv_encoder(x1) + self.conv_decoder(x2)
+        out = self.conv_attn(out)
+        return out * x2
+
+class ResUNetPlusPlus(nn.Module):
+    """
+        Based on "ResUNet++: An Advanced Architecture for Medical Image Segmentation"
+        https://arxiv.org/abs/1911.07067
+        https://github.com/rishikksh20/ResUnet
+    """
     def __init__(
             self,
             in_channels=1,
@@ -18,10 +143,11 @@ class ResUnetPlusPlus(nn.Module):
             filters=(32, 64, 128, 256, 512),
             use_decoder=True,
             head='mlp',
-            feat_dim=128
+            feat_dim=128,
+            use_conv_final=True
     ):
-        super(ResUnetPlusPlus, self).__init__()
-
+        super(ResUNetPlusPlus, self).__init__()
+        self.use_conv_final = use_conv_final
         self.use_decoder = use_decoder
 
         if not self.use_decoder:
@@ -54,24 +180,32 @@ class ResUnetPlusPlus(nn.Module):
         if self.use_decoder:
 
             self.attn1 = AttentionBlock(filters[3], filters[5], filters[5])
-            self.upsample1 = Upsample_(2)
+            self.upsample1 = Upsample(2)
             self.up_residual_conv1 = ResidualConv(filters[5] + filters[3], filters[4], 1, 1)
 
             self.attn2 = AttentionBlock(filters[2], filters[4], filters[4])
-            self.upsample2 = Upsample_(2)
+            self.upsample2 = Upsample(2)
             self.up_residual_conv2 = ResidualConv(filters[4] + filters[2], filters[3], 1, 1)
 
             self.attn3 = AttentionBlock(filters[1], filters[3], filters[3])
-            self.upsample3 = Upsample_(2)
+            self.upsample3 = Upsample(2)
             self.up_residual_conv3 = ResidualConv(filters[3] + filters[1], filters[2], 1, 1)
 
             self.attn4 = AttentionBlock(filters[0], filters[2], filters[2])
-            self.upsample4 = Upsample_(2)
+            self.upsample4 = Upsample(2)
             self.up_residual_conv4 = ResidualConv(filters[2] + filters[0], filters[1], 1, 1)
 
             self.aspp_out = ASPP(filters[1], filters[0])
 
-            self.output_layer = nn.Conv2d(filters[0], out_channels, 1)
+            if self.use_conv_final:
+                self.conv_last = nn.Conv2d(filters[0], out_channels, 1)
+
+    def freeze_encoder(self):
+        encoder_layers = [self.input_layer, self.input_skip, self.squeeze_excite1, self.residual_conv1,
+                          self.squeeze_excite2, self.residual_conv2, self.squeeze_excite3, self.residual_conv3,
+                          self.squeeze_excite4, self.residual_conv4, self.aspp_bridge]
+        for param in chain.from_iterable(layer.parameters() for layer in encoder_layers):
+            param.requires_grad = False
 
     def forward(self, x):
         x1 = self.input_layer(x) + self.input_skip(x)
@@ -115,14 +249,16 @@ class ResUnetPlusPlus(nn.Module):
         x10 = self.up_residual_conv4(x10)
 
         x11 = self.aspp_out(x10)
-        out = self.output_layer(x11)
 
-        return out
+        if self.use_conv_final:
+            x11 = self.conv_last(x11)
+
+        return x11
 
 
 if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = ResUnetPlusPlus(in_channels=1,
+    model = ResUNetPlusPlus(in_channels=1,
                             out_channels=2,
                             filters=(64, 128, 256, 512, 1024, 1024),
                             use_decoder=False,

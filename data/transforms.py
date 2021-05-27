@@ -7,7 +7,7 @@ from monai.config import KeysCollection, DtypeLike
 from monai.transforms.spatial.dictionary import GridSampleModeSequence, GridSamplePadModeSequence
 from monai.utils import GridSampleMode, GridSamplePadMode, ensure_tuple
 from monai.transforms import \
-    MapTransform, Randomizable, Compose, ConcatItemsd, DeleteItemsd, Lambdad, Spacingd, Lambda, Transform
+    MapTransform, Randomizable, Compose, ConcatItemsd, DeleteItemsd, Lambdad, Spacingd, Lambda, Transform, CopyItemsd
 
 
 class Spacing2Dd(Spacingd):
@@ -106,6 +106,27 @@ class EndOfCache(Randomizable, Transform):
         return data
 
 
+class KeepOriginald(MapTransform):
+    def __init__(
+            self,
+            keys: KeysCollection,
+            original_key_postfix: str = "orig",
+            do_transform: bool = True,
+            allow_missing_keys: bool = False
+    ) -> None:
+        super().__init__(keys, allow_missing_keys)
+        self.original_key_postfix = original_key_postfix
+        self.do_transform = do_transform
+        if self.do_transform:
+            orig_names = [f"{key}_{self.original_key_postfix}" for key in self.keys]
+            self.copier = CopyItemsd(keys=keys, times=1, names=orig_names)
+
+    def __call__(self, data: Any) -> Any:
+        if self.do_transform:
+            return self.copier.__call__(data)
+        return data
+
+
 class RandSampleSlice(Randomizable, MapTransform):
     def __init__(
             self,
@@ -134,7 +155,6 @@ class RandMultiTransformd(Compose, MapTransform):
             times: int,
             view_transforms: Optional[Callable[[KeysCollection], Sequence[Callable]]] = None,
             view_dim: int = 0,
-            keep_orig: bool = False,
             allow_missing_keys: bool = False
     ) -> None:
         MapTransform.__init__(self, keys, allow_missing_keys)
@@ -149,9 +169,6 @@ class RandMultiTransformd(Compose, MapTransform):
             keys_in_views = [[self.views_keys[k][i] for k in keys] for i in range(times)]
             view_transforms = [Compose(view_transforms(keys)) for keys in keys_in_views]
         all_views_keys = list(chain.from_iterable(self.views_keys.values()))
-        # Shallow copy of original keys (image -> image_orig, ...) for debugging purposes
-        if keep_orig:
-            view_transforms.append(Lambda(func=self._copy_orig))
         # Adds a new dimension at 'view_dim' to all views (image_1, ...)
         view_transforms.append(Lambdad(keys=all_views_keys, func=self._add_dim))
         # Concatenates views on dimension 'view_dim' and writes the result over original keys cat(image_1, image_2) -> image
@@ -161,11 +178,6 @@ class RandMultiTransformd(Compose, MapTransform):
         view_transforms.append(DeleteItemsd(keys=all_views_keys))
 
         Compose.__init__(self, view_transforms)
-
-    def _copy_orig(self, d):
-        for key in self.views_keys.keys():
-            d.update({key + "_orig": d[key]})
-        return d
 
     def _add_dim(self, d):
         if isinstance(d, torch.Tensor):
