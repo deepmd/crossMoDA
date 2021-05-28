@@ -99,8 +99,8 @@ def parse_option():
     for it in iterations:
         opt.lr_decay_epochs.append(int(it))
 
-    opt.model_name = f"{opt.dataset}_enc_{opt.model}_{opt.optimizer}_prts_{opt.n_parts}_lr_{opt.learning_rate}_" \
-                     f"decay_{opt.weight_decay}_bsz_{opt.batch_size}_bprts_{opt.batch_parts}_temp_{opt.temp}_indom_{opt.in_domain}"
+    opt.model_name = f"{opt.dataset}_enc_{opt.model}_{opt.optimizer}_lr_{opt.learning_rate}_decay_{opt.weight_decay}" + \
+                     f"_bsz_{opt.batch_size}_prts_{opt.n_parts}_bprts_{opt.batch_parts}_temp_{opt.temp}_indom_{opt.in_domain}"
 
     if opt.cosine:
         opt.model_name += "_cosine"
