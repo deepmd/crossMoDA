@@ -2,6 +2,7 @@ import datetime
 import logging
 import math
 import os
+from operator import itemgetter
 
 import numpy as np
 import torch
@@ -23,12 +24,6 @@ class AverageMeter(object):
         self.sum += val * n
         self.count += n
         self.avg = self.sum / self.count
-
-
-def mean(values):
-    if isinstance(values, dict):
-        values = values.values()
-    return sum(values) / len(values)
 
 
 def adjust_learning_rate(args, optimizer, epoch):

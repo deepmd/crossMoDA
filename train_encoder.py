@@ -1,19 +1,18 @@
 import os
 import argparse
-import sys
 import time
 import math
 
 import monai
 import torch
 import torch.backends.cudnn as cudnn
-from torch import optim
 from torch.utils.data import ConcatDataset
 from torch.utils.tensorboard import SummaryWriter
 from monai.data import DataLoader
 from matplotlib import pyplot as plt
 from tqdm import tqdm
 
+from optimizers import get_optimizer
 from util import \
     AverageMeter, adjust_learning_rate, warmup_learning_rate, save_checkpoint, set_up_logger, log_parameters
 from networks import get_model
@@ -44,6 +43,8 @@ def parse_option():
                         help='number of training epochs')
 
     # optimization
+    parser.add_argument('--optimizer', type=str, default='SGD',
+                        choices=['SGD', 'Adam'], help='optimizer')
     parser.add_argument('--learning_rate', type=float, default=0.05,
                         help='learning rate')
     parser.add_argument('--lr_decay_epochs', type=str, default='700,800,900',
@@ -98,8 +99,8 @@ def parse_option():
     for it in iterations:
         opt.lr_decay_epochs.append(int(it))
 
-    opt.model_name = f"{opt.dataset}_enc_{opt.model}_SGD_prts_{opt.n_parts}_lr_{opt.learning_rate}_decay_{opt.weight_decay}_" + \
-                     f"bsz_{opt.batch_size}_bprts_{opt.batch_parts}_temp_{opt.temp}_indom_{opt.in_domain}"
+    opt.model_name = f"{opt.dataset}_enc_{opt.model}_{opt.optimizer}_prts_{opt.n_parts}_lr_{opt.learning_rate}_" \
+                     f"decay_{opt.weight_decay}_bsz_{opt.batch_size}_bprts_{opt.batch_parts}_temp_{opt.temp}_indom_{opt.in_domain}"
 
     if opt.cosine:
         opt.model_name += "_cosine"
@@ -200,10 +201,7 @@ def set_model(opt):
         criterion = criterion.cuda()
         cudnn.benchmark = True
 
-    optimizer = optim.SGD(model.parameters(),
-                          lr=opt.learning_rate,
-                          momentum=opt.momentum,
-                          weight_decay=opt.weight_decay)
+    optimizer = get_optimizer(model.parameters(), opt)
 
     return model, criterion, optimizer
 

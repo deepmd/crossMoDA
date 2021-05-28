@@ -10,7 +10,6 @@ import monai
 import torch
 import torch.backends.cudnn as cudnn
 from monai.losses import DiceLoss
-from torch import optim
 
 from losses import HardnessWeightedDiceLoss
 from torch.utils.tensorboard import SummaryWriter
@@ -19,9 +18,9 @@ from matplotlib import pyplot as plt
 from tqdm import tqdm
 
 from metrics import compute_dice_score, compute_average_symmetric_surface_distance
+from optimizers import get_optimizer
 from util import \
-    AverageMeter, adjust_learning_rate, warmup_learning_rate, save_checkpoint, load_model, \
-    set_up_logger, log_parameters, mean
+    AverageMeter, adjust_learning_rate, warmup_learning_rate, save_checkpoint, load_model, set_up_logger, log_parameters
 from networks import get_model
 from data.dataset import CacheSliceDataset
 from data.VS_SEG import get_supervised_train_transforms, get_supervised_val_transforms, get_data, data_cfg
@@ -44,14 +43,18 @@ def parse_option():
                         help='number of training epochs')
 
     # optimization
-    parser.add_argument('--learning_rate', type=float, default=1e-4,
+    parser.add_argument('--optimizer', type=str, default='SGD',
+                        choices=['SGD', 'Adam'], help='optimizer')
+    parser.add_argument('--learning_rate', type=float, default=0.05,
                         help='learning rate')
-    parser.add_argument('--lr_decay_epochs', type=str, default='300,400',
+    parser.add_argument('--lr_decay_epochs', type=str, default='350,400,450',
                         help='where to decay lr, can be a list')
-    parser.add_argument('--lr_decay_rate', type=float, default=0.5,
+    parser.add_argument('--lr_decay_rate', type=float, default=0.1,
                         help='decay rate for learning rate')
-    parser.add_argument('--weight_decay', type=float, default=1e-7,
+    parser.add_argument('--weight_decay', type=float, default=1e-4,
                         help='weight decay')
+    parser.add_argument('--momentum', type=float, default=0.9,
+                        help='momentum')
 
     # model dataset
     parser.add_argument('--model', type=str,
@@ -97,7 +100,7 @@ def parse_option():
     for it in iterations:
         opt.lr_decay_epochs.append(int(it))
 
-    opt.model_name = f"{opt.dataset}_sup_{opt.model}_{opt.loss}_Adam_lr_{opt.learning_rate}_" + \
+    opt.model_name = f"{opt.dataset}_sup_{opt.model}_{opt.loss}_{opt.optimizer}_lr_{opt.learning_rate}_" + \
                      f"decay_{opt.weight_decay}_bsz_{opt.batch_size}"
 
     if opt.cosine:
@@ -218,9 +221,7 @@ def set_model(opt):
         criterion = criterion.cuda()
         cudnn.benchmark = True
 
-    optimizer = optim.Adam(model.parameters(),
-                          lr=opt.learning_rate,
-                          weight_decay=opt.weight_decay)
+    optimizer = get_optimizer(model.parameters(), opt)
 
     return model, criterion, optimizer
 
@@ -314,11 +315,11 @@ def train(train_loader, model, criterion, optimizer, epoch, opt):
             opt.logger.info(f"[{epoch}][{idx+1}/{len(train_loader)}]\t" +
                 f"BT {batch_time.val:.3f} ({batch_time.avg:.3f})\t" +
                 f"DT {data_time.val:.3f} ({data_time.avg:.3f})\t" +
-                f"Loss {losses.val:06.3f} ({losses.avg:06.3f})\t" +
-                f"DSC {dscs.val.mean().item():.3f} <{', '.join(f'{m.item():.3f}' for m in dscs.val)}> " +
-                f"({dscs.avg.mean().item():.3f} <{', '.join(f'{m.item():.3f}' for m in dscs.avg)}>)")
+                f"Loss {losses.val:.3f} ({losses.avg:.3f})\t" +
+                f"DSC {dscs.val[1:].mean().item():.3f} <{', '.join(f'{m.item():.3f}' for m in dscs.val)}> " +
+                f"({dscs.avg[1:].mean().item():.3f} <{', '.join(f'{m.item():.3f}' for m in dscs.avg)}>)")
 
-    return losses.avg, {cls: m for cls, m in zip(opt.classes, dscs.avg)}
+    return losses.avg, (dscs.avg[1:].mean().item(), {cls: m for cls, m in zip(opt.classes, dscs.avg)})
 
 
 def validate(source_val_loader, target_val_loader, model, opt):
@@ -365,10 +366,10 @@ def validate(source_val_loader, target_val_loader, model, opt):
                         assd, valid_n = compute_average_symmetric_surface_distance(vol_logits, vol_labels)
                         assds.update(assd, valid_n)
 
-        return {cls: m for cls, m in zip(opt.classes, source_dscs.avg)}, \
-               {cls: m for cls, m in zip(opt.classes, source_assds.avg)}, \
-               {cls: m for cls, m in zip(opt.classes, target_dscs.avg)}, \
-               {cls: m for cls, m in zip(opt.classes, target_assds.avg)}
+        return (source_dscs.avg[1:].mean().item(), {cls: m for cls, m in zip(opt.classes, source_dscs.avg)}), \
+               (source_assds.avg[1:].mean().item(), {cls: m for cls, m in zip(opt.classes, source_assds.avg)}), \
+               (target_dscs.avg[1:].mean().item(), {cls: m for cls, m in zip(opt.classes, target_dscs.avg)}), \
+               (target_assds.avg[1:].mean().item(), {cls: m for cls, m in zip(opt.classes, target_assds.avg)})
 
 
 def main():
@@ -410,26 +411,26 @@ def main():
         source_dsc, source_assd, target_dsc, target_assd = validate(source_val_loader, target_val_loader, model, opt)
         time3 = time.time()
         logger.info(f"Epoch {epoch}  Train: Time {(time2 - time1):.2f},  " +
-                    f"Loss {loss:.3f},  DSC {mean(dsc):.3f}")
+                    f"Loss {loss:.3f},  DSC {dsc[0]:.3f}")
         logger.info(f"{' '*(len(str(epoch))+1)}  Validation: Time {(time3 - time2):.2f},  " +
-                    f"S_DSC {mean(source_dsc):.3f} <{', '.join(f'{m:.3f}' for m in source_dsc.values())}>,  "
-                    f"S_ASSD {mean(source_assd):.3f} <{', '.join(f'{m:.3f}' for m in source_assd.values())}>,  "
-                    f"T_DSC {mean(target_dsc):.3f} <{', '.join(f'{m:.3f}' for m in target_dsc.values())}>,  "
-                    f"T_ASSD {mean(target_assd):.3f} <{', '.join(f'{m:.3f}' for m in target_assd.values())}>")
+                    f"S_DSC {source_dsc[0]:.3f} <{', '.join(f'{m:.3f}' for m in source_dsc[1].values())}>,  "
+                    f"S_ASSD {source_assd[0]:.1f} <{', '.join(f'{m:.1f}' for m in source_assd[1].values())}>,  "
+                    f"T_DSC {target_dsc[0]:.3f} <{', '.join(f'{m:.3f}' for m in target_dsc[1].values())}>,  "
+                    f"T_ASSD {target_assd[0]:.1f} <{', '.join(f'{m:.1f}' for m in target_assd[1].values())}>")
 
         # tensorboard logging
         tb_logger.add_scalar('train/loss', loss, epoch)
-        tb_logger.add_scalar('train/mean_dsc', mean(dsc), epoch)
-        tb_logger.add_scalar('val_source/mean_dsc', mean(source_dsc), epoch)
-        tb_logger.add_scalar('val_source/mean_assd', min(mean(source_assd), max_dist), epoch)
-        tb_logger.add_scalar('val_target/mean_dsc', mean(target_dsc), epoch)
-        tb_logger.add_scalar('val_target/mean_assd', min(mean(target_assd), max_dist), epoch)
-        for cls in dsc.keys():
-            tb_logger.add_scalar(f'train/dsc_{cls}', dsc[cls], epoch)
-            tb_logger.add_scalar(f'val_source/dsc_{cls}', source_dsc[cls], epoch)
-            tb_logger.add_scalar(f'val_source/assd_{cls}', min(source_assd[cls], max_dist), epoch)
-            tb_logger.add_scalar(f'val_target/dsc_{cls}', target_dsc[cls], epoch)
-            tb_logger.add_scalar(f'val_target/assd_{cls}', min(target_assd[cls], max_dist), epoch)
+        tb_logger.add_scalar('train/mean_dsc', dsc[0], epoch)
+        tb_logger.add_scalar('val_source/mean_dsc', source_dsc[0], epoch)
+        tb_logger.add_scalar('val_source/mean_assd', min(source_assd[0], max_dist), epoch)
+        tb_logger.add_scalar('val_target/mean_dsc', target_dsc[0], epoch)
+        tb_logger.add_scalar('val_target/mean_assd', min(target_assd[0], max_dist), epoch)
+        for cls in dsc[1].keys():
+            tb_logger.add_scalar(f'train/dsc_{cls}', dsc[1][cls], epoch)
+            tb_logger.add_scalar(f'val_source/dsc_{cls}', source_dsc[1][cls], epoch)
+            tb_logger.add_scalar(f'val_source/assd_{cls}', min(source_assd[1][cls], max_dist), epoch)
+            tb_logger.add_scalar(f'val_target/dsc_{cls}', target_dsc[1][cls], epoch)
+            tb_logger.add_scalar(f'val_target/assd_{cls}', min(target_assd[1][cls], max_dist), epoch)
         tb_logger.add_scalar('learning_rate', optimizer.param_groups[0]['lr'], epoch)
 
         if epoch % opt.save_freq == 0:
