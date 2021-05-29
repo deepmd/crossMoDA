@@ -17,8 +17,8 @@ from util import \
     AverageMeter, adjust_learning_rate, warmup_learning_rate, save_checkpoint, set_up_logger, log_parameters
 from networks import get_model
 from losses import SupConLoss
-from data.dataset import CachePartDataset, CacheSliceDataset
-from data.sampler import MultiDomainBatchSampler
+from data.datasets import CachePartDataset, CacheSliceDataset
+from data.samplers import MultiDomainBatchSampler
 from data.VS_SEG import get_encoder_train_transforms, get_encoder_val_transforms, get_data, data_cfg
 
 
@@ -139,6 +139,7 @@ def parse_option():
 
 
 def set_loader(opt):
+    logger = opt.logger
     source_train_transform, target_train_transform = get_encoder_train_transforms(opt)
     source_val_transform, target_val_transform = get_encoder_val_transforms(opt)
     (source_train_data, target_train_data), (source_val_data, target_val_data), _ = get_data(opt)
@@ -147,12 +148,12 @@ def set_loader(opt):
     if len(source_train_data) != len(target_train_data):
         raise ValueError(f"Length of source domain train data {(len(source_train_data))} is not equal to "
                          f"the length of target domain train data ({len(target_train_data)}).")
-    opt.logger.info("Caching source training data ...")
+    logger.info("Caching source training data ...")
     source_train_dataset = CachePartDataset(data=source_train_data, transform=source_train_transform,
-                                            parts_num=opt.n_parts, keys=["image"], num_workers=opt.num_workers)
-    opt.logger.info("Caching target training data ...")
+                                            parts_num=opt.n_parts, keys=["image"], num_workers=opt.num_workers//3)
+    logger.info("Caching target training data ...")
     target_train_dataset = CachePartDataset(data=target_train_data, transform=target_train_transform,
-                                            parts_num=opt.n_parts, keys=["image"], num_workers=opt.num_workers)
+                                            parts_num=opt.n_parts, keys=["image"], num_workers=opt.num_workers//3)
     train_dataset = ConcatDataset([source_train_dataset, target_train_dataset])
     batch_sampler = MultiDomainBatchSampler(
         domains_lengths=[len(source_train_data), len(target_train_data)],
@@ -164,24 +165,30 @@ def set_loader(opt):
         batch_sampler=batch_sampler,
         num_workers=opt.num_workers,
         pin_memory=True)
+    logger.info(f"Summary of the training data:")
+    logger.info(f"number of partitions = {len(train_dataset)}")
+    logger.info(f"number of batches    = {len(train_loader)}")
 
     # validation data
-    opt.logger.info("Caching source validation data ...")
+    logger.info("Caching source validation data ...")
     source_val_dataset = CacheSliceDataset(data=source_val_data, transform=source_val_transform,
-                                           keys=["image"], num_workers=opt.num_workers)
-    opt.logger.info("Caching target validation data ...")
+                                           keys=["image"], num_workers=opt.num_workers//3)
+    logger.info("Caching target validation data ...")
     target_val_dataset = CacheSliceDataset(data=target_val_data, transform=target_val_transform,
-                                           keys=["image"], num_workers=opt.num_workers)
+                                           keys=["image"], num_workers=opt.num_workers//3)
     source_val_loader = DataLoader(
         dataset=source_val_dataset,
-        batch_size=math.ceil(opt.batch_size//2),
+        batch_size=math.ceil(opt.batch_size),
         num_workers=opt.num_workers,
         pin_memory=True)
     target_val_loader = DataLoader(
         dataset=target_val_dataset,
-        batch_size=math.ceil(opt.batch_size//2),
+        batch_size=math.ceil(opt.batch_size),
         num_workers=opt.num_workers,
         pin_memory=True)
+    logger.info(f"Summary of the validation data:")
+    logger.info(f"number of slices  (source/target) = {len(source_val_dataset)}/{len(target_val_dataset)}")
+    logger.info(f"number of batches (source/target) = {len(source_val_loader)}/{len(target_val_loader)}")
 
     return train_loader, source_val_loader, target_val_loader
 
@@ -211,10 +218,7 @@ def check_train_data(train_loader, opt, max_samples=None):
     samples_path = os.path.join(opt.log_folder, "train_samples")
     if not os.path.isdir(samples_path):
         os.makedirs(samples_path)
-    logger.info("Summary of the train data:")
-    logger.info(f"number of partitions = {len(train_loader.dataset)}")
-    logger.info(f"number of batches    = {len(train_loader)}")
-    logger.info(f"Saving sample data to {samples_path}")
+    logger.info(f"Saving train sample data to {samples_path}")
     max_samples = len(train_loader.dataset) if max_samples is None else max_samples
     samples_num = 0
     for idx, batch_data in enumerate(tqdm(train_loader, desc="Saving  samples"), start=1):
@@ -247,10 +251,7 @@ def check_val_data(data_loader, opt, name, max_samples=None):
     samples_path = os.path.join(opt.log_folder, f"{name}_samples")
     if not os.path.isdir(samples_path):
         os.makedirs(samples_path)
-    logger.info(f"Summary of the {name} data:")
-    logger.info(f"number of slices    = {len(data_loader.dataset)}")
-    logger.info(f"number of batches   = {len(data_loader)}")
-    logger.info(f"Saving sample data to {samples_path}")
+    logger.info(f"Saving {name} sample data to {samples_path}")
     max_samples = len(data_loader.dataset) if max_samples is None else max_samples
     samples_num = 0
     for idx, batch_data in enumerate(tqdm(data_loader, desc="Saving  samples"), start=1):

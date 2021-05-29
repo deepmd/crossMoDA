@@ -57,6 +57,7 @@ class CacheSliceDataset(CacheDataset):
             transform: Union[Sequence[Callable], Callable],
             keys: KeysCollection,
             stats_collector: Optional[Callable[[Dict], Dict]] = None,
+            filter_slices: Optional[Callable[[Dict], np.ndarray]] = None,
             num_workers: Optional[int] = None,
             progress: bool = True,
             copy_other_keys: bool = True
@@ -65,6 +66,7 @@ class CacheSliceDataset(CacheDataset):
         self.keys = ensure_tuple(keys)
         self.copy_other_keys = copy_other_keys
         self.stats_collector = stats_collector
+        self.filter_slices = filter_slices
         self._cache, slices_nums = self._slice_cache(self._cache)
         self.cache_num = len(self._cache)
         self.data = [x for i, x in enumerate(self.data) for _ in range(slices_nums[i])]
@@ -83,18 +85,33 @@ class CacheSliceDataset(CacheDataset):
                     item[stat_key] = stat_value
                     stat_keys.append(stat_key)
             stat_keys = ensure_tuple(stat_keys)
-            # divide to slices
             slices = dict()
-            slices_num = item[self.keys[0]].shape[-1]
+            all_slices_num = item[self.keys[0]].shape[-1]
+            # fliter slices
+            if self.filter_slices is not None:
+                slices_idxs = self.filter_slices(item).astype(bool)
+                if slices_idxs.ndim != 1 or len(slices_idxs) != all_slices_num:
+                    raise ValueError(f"filter_slices must return a 1 dimensional array of length ({all_slices_num}) " +
+                                     f"but an array of size {tuple(slices_idxs.shape)} was returned.")
+                slices_num = np.sum(slices_idxs)
+            else:
+                slices_idxs = None
+                slices_num = all_slices_num
+            # divide to slices
             for key in (self.keys + stat_keys):
-                if item[key].shape[-1] != slices_num:
+                arr = item[key]
+                if slices_idxs is not None:
+                    arr = arr[..., slices_idxs]
+                if arr.shape[-1] != slices_num:
                     raise ValueError(f"Different number of slices exist in key '{key}'.")
-                if isinstance(item[key], torch.Tensor) or isinstance(item[key], np.ndarray):
-                    slices[key] = [item[key][..., i] for i in range(slices_num)]
+                if isinstance(arr, torch.Tensor) or isinstance(arr, np.ndarray):
+                    slices[key] = [arr[..., i] for i in range(slices_num)]
                 else:
-                    raise TypeError(f"Cannot divide slices of type {type(item[key]).__name__}.")
-            slices['slice_idx'] = np.arange(slices_num)  # list(range(slices_num)) has issues, if used in ToTensord
-            slices['vol_idx'] = np.repeat(idx, slices_num)  # [idx]*slices_num has issues, if used in ToTensord
+                    raise TypeError(f"Cannot divide slices of type {type(arr).__name__}.")
+            slices['slice_idx'] = np.arange(all_slices_num)
+            if slices_idxs is not None:
+                slices['slice_idx'] = slices['slice_idx'][slices_idxs]
+            slices['vol_idx'] = np.repeat(idx, slices_num)
             if self.copy_other_keys:
                 for other_key in item.keys():
                     if other_key not in (self.keys + stat_keys):

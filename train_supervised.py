@@ -3,6 +3,7 @@ import argparse
 import time
 import math
 from collections import defaultdict
+from functools import partial
 from operator import itemgetter
 
 import numpy as np
@@ -23,7 +24,7 @@ from optimizers import get_optimizer
 from util import \
     AverageMeter, adjust_learning_rate, warmup_learning_rate, save_checkpoint, load_model, set_up_logger, log_parameters
 from networks import get_model
-from data.dataset import CacheSliceDataset
+from data.datasets import CacheSliceDataset
 from data.VS_SEG import get_supervised_train_transforms, get_supervised_val_transforms, get_data, data_cfg
 
 
@@ -68,6 +69,8 @@ def parse_option():
     parser.add_argument('--include_target', action='store_true',
                         help='include target domain images and labels in training')
     parser.add_argument('--size', type=int, default=384, help='expected size of input')
+    parser.add_argument('--fg_thresh', type=float, default=None,
+                        help='foreground ratio threshold to filter training slices')
 
     # other setting
     parser.add_argument('--loss', type=str, default="HDLoss",
@@ -106,6 +109,9 @@ def parse_option():
     opt.model_name = f"{opt.dataset}_sup_{opt.model}_{opt.loss}_{opt.optimizer}_lr_{opt.learning_rate}_" + \
                      f"decay_{opt.weight_decay}_bsz_{opt.batch_size}"
 
+    if opt.fg_thresh is not None:
+        opt.model_name += f"_fgtr_{opt.fg_thresh}"
+
     if opt.cosine:
         opt.model_name += "_cosine"
 
@@ -122,6 +128,9 @@ def parse_option():
                     1 + math.cos(math.pi * opt.warm_epochs / opt.epochs)) / 2
         else:
             opt.warmup_to = opt.learning_rate
+
+    if opt.include_target:
+        opt.model_name += "_target"
 
     opt.model_name += f"_trial_{opt.trial}"
 
@@ -142,35 +151,48 @@ def parse_option():
     return opt
 
 
-def _mask_stat(data):
-    labels = data["label"]
-    if isinstance(labels, np.ndarray):
-        labels = np.sum(labels, axis=1)
-        masks = (labels > 0).astype(np.int32)
-        masks_areas = np.mean(masks, axis=(0, 1))
-        return {"masks_area": masks_areas}
-    elif isinstance(labels, torch.Tensor):
-        labels = torch.sum(labels, dim=0)
-        masks = (labels > 0).float()
-        masks_areas = torch.mean(masks, dim=(0, 1))
-        return {"masks_area": masks_areas}
+def _foreground_stat(data):
+    label = data["label"]
+    total_area = label.shape[0] * label.shape[1]
+    if isinstance(label, np.ndarray):
+        label = np.sum(label, axis=1)
+        foreground = (label > 0).astype(np.int32)
+        foreground = np.sum(foreground, axis=(0, 1)) / total_area
+        return {"fg_ratio": foreground}
+    elif isinstance(label, torch.Tensor):
+        label = torch.sum(label, dim=0)
+        foreground = (label > 0).float()
+        foreground = torch.sum(foreground, dim=(0, 1)) / total_area
+        return {"fg_ratio": foreground}
     else:
-        raise TypeError(f"Cannot calculate mask stats for type {type(labels).__name__}.")
+        raise TypeError(f"Cannot calculate foreground ratio for type {type(label).__name__}.")
+
+
+def _filter_slices_by_fg_ratio(data, threshold):
+    stat = _foreground_stat(data)
+    return stat["fg_ratio"] > threshold
 
 
 def set_loader(opt):
+    logger = opt.logger
     source_train_transform, target_train_transform = get_supervised_train_transforms(opt)
     source_val_transform, target_val_transform = get_supervised_val_transforms(opt)
     (source_train_data, target_train_data), (source_val_data, target_val_data), _ = get_data(opt)
 
     # train data
-    opt.logger.info("Caching source training data ...")
+    _filter_slices = None
+    if opt.fg_thresh is not None:
+        _filter_slices = partial(_filter_slices_by_fg_ratio, threshold=opt.fg_thresh)
+
+    logger.info("Caching source training data ...")
     train_dataset = CacheSliceDataset(data=source_train_data, transform=source_train_transform,
-                                      keys=["image", "label"], num_workers=opt.num_workers)
+                                      keys=["image", "label"], num_workers=opt.num_workers//3,
+                                      filter_slices=_filter_slices)
     if opt.include_target:
-        opt.logger.info("Caching target training data ...")
+        logger.info("Caching target training data ...")
         target_train_dataset = CacheSliceDataset(data=target_train_data, transform=target_train_transform,
-                                                 keys=["image", "label"], num_workers=opt.num_workers)
+                                                 keys=["image", "label"], num_workers=opt.num_workers//3,
+                                                 filter_slices=_filter_slices)
         train_dataset = ConcatDataset([train_dataset, target_train_dataset])
     train_loader = DataLoader(
         dataset=train_dataset,
@@ -178,14 +200,17 @@ def set_loader(opt):
         shuffle=True,
         num_workers=opt.num_workers,
         pin_memory=True)
+    logger.info(f"Summary of the training data:")
+    logger.info(f"number of slices  = {len(train_dataset)}")
+    logger.info(f"number of batches = {len(train_loader)}")
 
     # validation data
-    opt.logger.info("Caching source validation data ...")
+    logger.info("Caching source validation data ...")
     source_val_dataset = CacheSliceDataset(data=source_val_data, transform=source_val_transform,
-                                           keys=["image", "label"], num_workers=opt.num_workers)
-    opt.logger.info("Caching target validation data ...")
+                                           keys=["image", "label"], num_workers=opt.num_workers//3)
+    logger.info("Caching target validation data ...")
     target_val_dataset = CacheSliceDataset(data=target_val_data, transform=target_val_transform,
-                                           keys=["image", "label"], num_workers=opt.num_workers)
+                                           keys=["image", "label"], num_workers=opt.num_workers//3)
     source_val_loader = DataLoader(
         dataset=source_val_dataset,
         batch_size=opt.batch_size,
@@ -198,6 +223,9 @@ def set_loader(opt):
         shuffle=False,  # important otherwise cannot create volumes out of slices in validate
         num_workers=opt.num_workers,
         pin_memory=True)
+    logger.info(f"Summary of the validation data:")
+    logger.info(f"number of slices  (source/target) = {len(source_val_dataset)}/{len(target_val_dataset)}")
+    logger.info(f"number of batches (source/target) = {len(source_val_loader)}/{len(target_val_loader)}")
 
     return train_loader, source_val_loader, target_val_loader
 
@@ -239,10 +267,7 @@ def check_data(data_loader, opt, name, max_samples=None):
     samples_path = os.path.join(opt.log_folder, f"{name}_samples")
     if not os.path.isdir(samples_path):
         os.makedirs(samples_path)
-    logger.info(f"Summary of the {name} data:")
-    logger.info(f"number of slices    = {len(data_loader.dataset)}")
-    logger.info(f"number of batches   = {len(data_loader)}")
-    logger.info(f"Saving sample data to {samples_path}")
+    logger.info(f"Saving {name} sample data to {samples_path}")
     max_samples = len(data_loader.dataset) if max_samples is None else max_samples
     samples_num = 0
     for idx, batch_data in enumerate(tqdm(data_loader, desc="Saving  samples"), start=1):
