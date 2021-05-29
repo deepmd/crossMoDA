@@ -10,6 +10,7 @@ import monai
 import torch
 import torch.backends.cudnn as cudnn
 from monai.losses import DiceLoss
+from torch.utils.data import ConcatDataset
 
 from losses import HardnessWeightedDiceLoss
 from torch.utils.tensorboard import SummaryWriter
@@ -64,6 +65,8 @@ def parse_option():
     parser.add_argument("--split", type=str, default="split.csv",
                         help="path to CSV file that defines training, validation and test datasets")
     parser.add_argument('--data_folder', type=str, default=None, help='path to custom dataset')
+    parser.add_argument('--include_target', action='store_true',
+                        help='include target domain images and labels in training')
     parser.add_argument('--size', type=int, default=384, help='expected size of input')
 
     # other setting
@@ -158,12 +161,17 @@ def _mask_stat(data):
 def set_loader(opt):
     source_train_transform, target_train_transform = get_supervised_train_transforms(opt)
     source_val_transform, target_val_transform = get_supervised_val_transforms(opt)
-    (source_train_data, _), (source_val_data, target_val_data), _ = get_data(opt)
+    (source_train_data, target_train_data), (source_val_data, target_val_data), _ = get_data(opt)
 
     # train data
     opt.logger.info("Caching source training data ...")
     train_dataset = CacheSliceDataset(data=source_train_data, transform=source_train_transform,
                                       keys=["image", "label"], num_workers=opt.num_workers)
+    if opt.include_target:
+        opt.logger.info("Caching target training data ...")
+        target_train_dataset = CacheSliceDataset(data=target_train_data, transform=target_train_transform,
+                                                 keys=["image", "label"], num_workers=opt.num_workers)
+        train_dataset = ConcatDataset([train_dataset, target_train_dataset])
     train_loader = DataLoader(
         dataset=train_dataset,
         batch_size=opt.batch_size,
