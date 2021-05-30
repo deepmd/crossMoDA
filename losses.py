@@ -24,7 +24,7 @@ class SupConLoss(nn.Module):
         self.contrast_mode = contrast_mode
         self.base_temperature = base_temperature
 
-    def forward(self, features, labels=None, mask=None):
+    def forward(self, features, labels=None, mask=None, neg_mask=None):
         """Compute loss for model. If both `labels` and `mask` are None,
         it degenerates to SimCLR unsupervised loss:
         https://arxiv.org/pdf/2002.05709.pdf
@@ -32,8 +32,10 @@ class SupConLoss(nn.Module):
         Args:
             features: hidden vector of shape [bsz, n_views, ...].
             labels: ground truth of shape [bsz].
-            mask: contrastive mask of shape [bsz, bsz], mask_{i,j}=1 if sample j
-                has the same class as sample i. Can be asymmetric.
+            mask: contrastive mask of shape [bsz, bsz], mask_{i,j}=1 if sample j should be considered as
+               positive to sample i (e.g. has the same class as i). Can be asymmetric.
+            neg_mask: contrastive mask of shape [bsz, bsz], mask_{i,j}=1 if sample j should be considered as
+               negative to sample i. Can be asymmetric. Self-contrast cases (main diagonal) will mask out anyway.
         Returns:
             A loss scalar.
         """
@@ -60,6 +62,11 @@ class SupConLoss(nn.Module):
         else:
             mask = mask.float().to(device)
 
+        if neg_mask is None:
+            neg_mask = torch.ones_like(mask)
+        else:
+            neg_mask = neg_mask.float().to(device)
+
         contrast_count = features.shape[1]
         contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)
         if self.contrast_mode == 'one':
@@ -81,9 +88,10 @@ class SupConLoss(nn.Module):
 
         # tile mask
         mask = mask.repeat(anchor_count, contrast_count)
+        neg_mask = neg_mask.repeat(anchor_count, contrast_count)
         # mask-out self-contrast cases
-        logits_mask = torch.scatter(   ## all ones but zero in the "main" diagonal to prevent contrasting samples with themselves
-            torch.ones_like(mask),
+        logits_mask = torch.scatter(   ## zero out the "main" diagonal to prevent contrasting samples with themselves
+            neg_mask,
             1,
             torch.arange(batch_size * anchor_count).view(-1, 1).to(device),
             0

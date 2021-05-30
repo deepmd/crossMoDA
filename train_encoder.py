@@ -328,11 +328,14 @@ def train(train_loader, model, criterion, optimizer, epoch, opt):
             all_features = torch.cat((source_features, target_features), dim=0)
             all_labels = torch.cat((source_labels, target_labels), dim=0)
             mask_all = torch.eq(all_labels, all_labels.T).float()
-            mask_source = torch.eq(source_labels, source_labels.T).float()
-            mask_target = torch.eq(target_labels, target_labels.T).float()
-            mask_all[:bsz, :bsz] -= mask_source
-            mask_all[bsz:, bsz:] -= mask_target
-            cross_loss = criterion(all_features, mask=mask_all)
+            # mask-out all in-domain positives
+            mask_all[:bsz, :bsz] = 0
+            mask_all[bsz:, bsz:] = 0
+            neg_mask_all = torch.ones_like(mask_all)
+            # mask-out all in-domain negatives
+            neg_mask_all[:bsz, :bsz] = 0
+            neg_mask_all[bsz:, bsz:] = 0
+            cross_loss = criterion(all_features, mask=mask_all, neg_mask=neg_mask_all)
         else:
             cross_loss = torch.tensor(0).to(source_loss.device)
 
