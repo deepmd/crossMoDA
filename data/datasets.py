@@ -2,6 +2,7 @@ from copy import deepcopy
 
 import torch
 from monai.data.dataset import CacheDataset
+from monai.transforms import Compose, Randomizable, Transform, apply_transform
 from monai.utils import ensure_tuple
 from monai.config.type_definitions import KeysCollection
 from typing import Callable, List, Optional, Sequence, Union, Tuple, Dict
@@ -49,6 +50,27 @@ class CachePartDataset(CacheDataset):
             split_cache.extend(split_items)
         return split_cache
 
+    # There's an issue with random InvertibleTransform pushing entries in <key>_transforms, leading to lists with
+    # different lengths which causes problem in list_data_collate.
+    # This issue has been resolved in https://github.com/Project-MONAI/MONAI/pull/2121 but has not been released in
+    # stable version yet. This overridden function may not be required in future versions of monai.
+    def _transform(self, index: int):
+        # load data from cache and execute from the first random transform
+        start_run = False
+        if self._cache is None:
+            raise ValueError("Cache must have been filled.")
+        data = self._cache[index]
+        if not isinstance(self.transform, Compose):
+            raise ValueError("transform must be an instance of monai.transforms.Compose.")
+        for _transform in self.transform.transforms:
+            if start_run or isinstance(_transform, Randomizable) or not isinstance(_transform, Transform):
+                # only need to deep copy data on first non-deterministic transform
+                if not start_run:
+                    start_run = True
+                    data = deepcopy(data)
+                data = apply_transform(_transform, data)
+        return data
+
 
 class CacheSliceDataset(CacheDataset):
     def __init__(
@@ -56,8 +78,8 @@ class CacheSliceDataset(CacheDataset):
             data: Sequence,
             transform: Union[Sequence[Callable], Callable],
             keys: KeysCollection,
-            stats_collector: Optional[Callable[[Dict], Dict]] = None,
             filter_slices: Optional[Callable[[Dict], np.ndarray]] = None,
+            weight_slices: Optional[Callable[[Dict], np.ndarray]] = None,
             num_workers: Optional[int] = None,
             progress: bool = True,
             copy_other_keys: bool = True
@@ -65,8 +87,8 @@ class CacheSliceDataset(CacheDataset):
         super().__init__(data=data, transform=transform, num_workers=num_workers, progress=progress)
         self.keys = ensure_tuple(keys)
         self.copy_other_keys = copy_other_keys
-        self.stats_collector = stats_collector
         self.filter_slices = filter_slices
+        self.weight_slices = weight_slices
         self._cache, slices_nums = self._slice_cache(self._cache)
         self.cache_num = len(self._cache)
         self.data = [x for i, x in enumerate(self.data) for _ in range(slices_nums[i])]
@@ -75,29 +97,28 @@ class CacheSliceDataset(CacheDataset):
         slice_cache = []
         slices_nums = []
         for idx, item in enumerate(cache):
-            # collect stats
-            stat_keys = []
-            if self.stats_collector is not None:
-                stats_dict = self.stats_collector(item)
-                for stat_key, stat_value in stats_dict.items():
-                    if stat_key in item:
-                        raise KeyError(f"Key {stat_key} already exists in data.")
-                    item[stat_key] = stat_value
-                    stat_keys.append(stat_key)
-            stat_keys = ensure_tuple(stat_keys)
-            slices = dict()
             all_slices_num = item[self.keys[0]].shape[-1]
+            # calculate slices weights
+            stat_keys = tuple()
+            if self.weight_slices is not None:
+                weights = self.weight_slices(item)
+                if weights.ndim != 1 or len(weights) != all_slices_num:
+                    raise ValueError(f"weight_slices must return a 1-dimensional float array of length " +
+                                     f"({all_slices_num}) but an array of size {tuple(weights.shape)} was returned.")
+                item["weight"] = weights
+                stat_keys = ("weight",)
             # fliter slices
             if self.filter_slices is not None:
-                slices_idxs = self.filter_slices(item).astype(bool)
+                slices_idxs = self.filter_slices(item)
                 if slices_idxs.ndim != 1 or len(slices_idxs) != all_slices_num:
-                    raise ValueError(f"filter_slices must return a 1 dimensional array of length ({all_slices_num}) " +
-                                     f"but an array of size {tuple(slices_idxs.shape)} was returned.")
+                    raise ValueError(f"filter_slices must return a 1-dimensional boolean array of length " +
+                                     f"({all_slices_num}) but an array of size {tuple(slices_idxs.shape)} was returned.")
                 slices_num = np.sum(slices_idxs)
             else:
                 slices_idxs = None
                 slices_num = all_slices_num
             # divide to slices
+            slices = dict()
             for key in (self.keys + stat_keys):
                 arr = item[key]
                 if slices_idxs is not None:
@@ -121,3 +142,29 @@ class CacheSliceDataset(CacheDataset):
             slice_cache.extend(slices)
             slices_nums.append(slices_num)
         return slice_cache, slices_nums
+
+    # There's an issue with random InvertibleTransform pushing entries in <key>_transforms, leading to lists with
+    # different lengths which causes problem in list_data_collate.
+    # This issue has been resolved in https://github.com/Project-MONAI/MONAI/pull/2121 but has not been released in
+    # stable version yet. This overridden function may not be required in future versions of monai.
+    def _transform(self, index: int):
+        # load data from cache and execute from the first random transform
+        start_run = False
+        if self._cache is None:
+            raise ValueError("Cache must have been filled.")
+        data = self._cache[index]
+        if not isinstance(self.transform, Compose):
+            raise ValueError("transform must be an instance of monai.transforms.Compose.")
+        for _transform in self.transform.transforms:
+            if start_run or isinstance(_transform, Randomizable) or not isinstance(_transform, Transform):
+                # only need to deep copy data on first non-deterministic transform
+                if not start_run:
+                    start_run = True
+                    data = deepcopy(data)
+                data = apply_transform(_transform, data)
+        return data
+
+    def get_weights(self):
+        if self.weight_slices is not None:
+            return torch.DoubleTensor([item["weight"].item() for item in self._cache])
+        return torch.ones(self.cache_num, dtype=torch.double)

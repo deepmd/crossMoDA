@@ -39,7 +39,7 @@ def encoder_train_transforms(opt, domain):
                     RandSpatialCropd(keys=keys, roi_size=(opt.size, opt.size), random_center=True, random_size=False)
                 ]
             ),
-            ToTensord(keys=["image"])
+            ToTensord(keys=["image", "part_idx"])
         ]
     )
 

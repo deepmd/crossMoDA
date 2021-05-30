@@ -109,7 +109,7 @@ def parse_option():
     if opt.batch_size > 256:
         opt.warm = True
     if opt.warm:
-        opt.model_name += "{}_warm"
+        opt.model_name += "_warm"
         opt.warmup_from = 0.01
         opt.warm_epochs = 10
         if opt.cosine:

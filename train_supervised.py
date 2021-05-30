@@ -11,7 +11,7 @@ import monai
 import torch
 import torch.backends.cudnn as cudnn
 from monai.losses import DiceLoss
-from torch.utils.data import ConcatDataset
+from torch.utils.data import ConcatDataset, WeightedRandomSampler
 
 from losses import HardnessWeightedDiceLoss
 from torch.utils.tensorboard import SummaryWriter
@@ -66,9 +66,11 @@ def parse_option():
     parser.add_argument("--split", type=str, default="split.csv",
                         help="path to CSV file that defines training, validation and test datasets")
     parser.add_argument('--data_folder', type=str, default=None, help='path to custom dataset')
+    parser.add_argument('--size', type=int, default=384, help='expected size of input')
     parser.add_argument('--include_target', action='store_true',
                         help='include target domain images and labels in training')
-    parser.add_argument('--size', type=int, default=384, help='expected size of input')
+    parser.add_argument('--fg_weighted', action='store_true',
+                        help='sample training slices based on their foreground ratio')
     parser.add_argument('--fg_thresh', type=float, default=None,
                         help='foreground ratio threshold to filter training slices')
 
@@ -111,6 +113,8 @@ def parse_option():
 
     if opt.fg_thresh is not None:
         opt.model_name += f"_fgtr_{opt.fg_thresh}"
+    if opt.fg_weighted:
+        opt.model_name += "_fgw"
 
     if opt.cosine:
         opt.model_name += "_cosine"
@@ -119,7 +123,7 @@ def parse_option():
     if opt.batch_size > 256:
         opt.warm = True
     if opt.warm:
-        opt.model_name += "{}_warm"
+        opt.model_name += "_warm"
         opt.warmup_from = 0.01
         opt.warm_epochs = 10
         if opt.cosine:
@@ -151,26 +155,34 @@ def parse_option():
     return opt
 
 
-def _foreground_stat(data):
+def _get_foreground_ratio(data):
     label = data["label"]
     total_area = label.shape[0] * label.shape[1]
     if isinstance(label, np.ndarray):
         label = np.sum(label, axis=1)
-        foreground = (label > 0).astype(np.int32)
+        foreground = (label > 0).astype(float)
         foreground = np.sum(foreground, axis=(0, 1)) / total_area
-        return {"fg_ratio": foreground}
+        return foreground
     elif isinstance(label, torch.Tensor):
         label = torch.sum(label, dim=0)
         foreground = (label > 0).float()
         foreground = torch.sum(foreground, dim=(0, 1)) / total_area
-        return {"fg_ratio": foreground}
+        return foreground
     else:
         raise TypeError(f"Cannot calculate foreground ratio for type {type(label).__name__}.")
 
 
 def _filter_slices_by_fg_ratio(data, threshold):
-    stat = _foreground_stat(data)
-    return stat["fg_ratio"] > threshold
+    fg_ratio = _get_foreground_ratio(data)
+    return fg_ratio > threshold
+
+
+def _weight_slices_by_fg_ratio(data):
+    fg_ratio = _get_foreground_ratio(data)
+    # weights = (fg_ratio + 1e-10) ** 0.1
+    weigths = torch.ones(len(fg_ratio))
+    weigths[fg_ratio > 0] *= 7
+    return weigths
 
 
 def set_loader(opt):
@@ -180,24 +192,31 @@ def set_loader(opt):
     (source_train_data, target_train_data), (source_val_data, target_val_data), _ = get_data(opt)
 
     # train data
-    _filter_slices = None
+    filter_slices = None
     if opt.fg_thresh is not None:
-        _filter_slices = partial(_filter_slices_by_fg_ratio, threshold=opt.fg_thresh)
+        filter_slices = partial(_filter_slices_by_fg_ratio, threshold=opt.fg_thresh)
+    weight_slices = None
+    if opt.fg_weighted:
+        weight_slices = _weight_slices_by_fg_ratio
 
     logger.info("Caching source training data ...")
     train_dataset = CacheSliceDataset(data=source_train_data, transform=source_train_transform,
                                       keys=["image", "label"], num_workers=opt.num_workers//3,
-                                      filter_slices=_filter_slices)
+                                      filter_slices=filter_slices, weight_slices=weight_slices)
+    weights = train_dataset.get_weights()
     if opt.include_target:
         logger.info("Caching target training data ...")
         target_train_dataset = CacheSliceDataset(data=target_train_data, transform=target_train_transform,
                                                  keys=["image", "label"], num_workers=opt.num_workers//3,
-                                                 filter_slices=_filter_slices)
+                                                 filter_slices=filter_slices, weight_slices=weight_slices)
+        weights = torch.cat([weights, target_train_dataset.get_weights()])
         train_dataset = ConcatDataset([train_dataset, target_train_dataset])
+
     train_loader = DataLoader(
         dataset=train_dataset,
         batch_size=opt.batch_size,
-        shuffle=True,
+        sampler=WeightedRandomSampler(weights, num_samples=len(weights)) if opt.fg_weighted else None,
+        shuffle=not opt.fg_weighted,
         num_workers=opt.num_workers,
         pin_memory=True)
     logger.info(f"Summary of the training data:")

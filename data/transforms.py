@@ -7,7 +7,7 @@ from monai.config import KeysCollection, DtypeLike
 from monai.transforms.spatial.dictionary import GridSampleModeSequence, GridSamplePadModeSequence
 from monai.utils import GridSampleMode, GridSamplePadMode, ensure_tuple
 from monai.transforms import \
-    MapTransform, Randomizable, Compose, ConcatItemsd, DeleteItemsd, Lambdad, Spacingd, Lambda, Transform, CopyItemsd
+    MapTransform, Randomizable, Compose, ConcatItemsd, DeleteItemsd, Lambdad, Spacingd, Transform, CopyItemsd
 
 
 class Spacing2Dd(Spacingd):
@@ -31,9 +31,8 @@ class Spacing2Dd(Spacingd):
     def __call__(
             self, data: Mapping[Union[Hashable, str], Dict[str, np.ndarray]]
     ) -> Dict[Union[Hashable, str], Union[np.ndarray, Dict[str, np.ndarray]]]:
-        d: Dict = dict(data)
         meta_data_key = f"{self.keys[0]}_{self.meta_key_postfix}"
-        meta_data = d[meta_data_key]
+        meta_data = data[meta_data_key]
         pixdim_z = meta_data["pixdim"][3]
         pixdim = self.spacing_transform.pixdim
         self.spacing_transform.pixdim = np.array([pixdim[0], pixdim[1], pixdim_z])
@@ -55,7 +54,7 @@ class AlignCropd(MapTransform):
         self.meta_key_postfix = meta_key_postfix
 
     def __call__(self, data: Mapping[Hashable, np.ndarray]) -> Dict[Hashable, np.ndarray]:
-        d: Dict = dict(data)
+        d = dict(data)
         for key in self.key_iterator(d):
             meta_data_key = f"{key}_{self.meta_key_postfix}"
             meta_data = d[meta_data_key]
@@ -173,7 +172,7 @@ class RandMultiTransformd(Compose, MapTransform):
         view_transforms.append(Lambdad(keys=all_views_keys, func=self._add_dim))
         # Concatenates views on dimension 'view_dim' and writes the result over original keys cat(image_1, image_2) -> image
         view_transforms.extend(
-            [ConcatItemsd(keys=keys, name=orig_key, dim=view_dim) for (orig_key, keys) in self.views_keys.items()])
+            [ConcatItemsd(keys=keys, name=orig_key, dim=self.view_dim) for (orig_key, keys) in self.views_keys.items()])
         # Deletes all views (image_1, ...)
         view_transforms.append(DeleteItemsd(keys=all_views_keys))
 
