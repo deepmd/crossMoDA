@@ -2,7 +2,6 @@ from copy import deepcopy
 
 import torch
 from monai.data.dataset import CacheDataset
-from monai.transforms import Compose, Randomizable, Transform, apply_transform
 from monai.utils import ensure_tuple
 from monai.config.type_definitions import KeysCollection
 from typing import Callable, List, Optional, Sequence, Union, Tuple, Dict
@@ -49,27 +48,6 @@ class CachePartDataset(CacheDataset):
             split_items = [{k: v[i] for k, v in split_items.items()} for i in range(parts_num)]
             split_cache.extend(split_items)
         return split_cache
-
-    # There's an issue with random InvertibleTransform pushing entries in <key>_transforms, leading to lists with
-    # different lengths which causes problem in list_data_collate.
-    # This issue has been resolved in https://github.com/Project-MONAI/MONAI/pull/2121 but has not been released in
-    # stable version yet. This overridden function may not be required in future versions of monai.
-    def _transform(self, index: int):
-        # load data from cache and execute from the first random transform
-        start_run = False
-        if self._cache is None:
-            raise ValueError("Cache must have been filled.")
-        data = self._cache[index]
-        if not isinstance(self.transform, Compose):
-            raise ValueError("transform must be an instance of monai.transforms.Compose.")
-        for _transform in self.transform.transforms:
-            if start_run or isinstance(_transform, Randomizable) or not isinstance(_transform, Transform):
-                # only need to deep copy data on first non-deterministic transform
-                if not start_run:
-                    start_run = True
-                    data = deepcopy(data)
-                data = apply_transform(_transform, data)
-        return data
 
 
 class CacheSliceDataset(CacheDataset):
@@ -142,27 +120,6 @@ class CacheSliceDataset(CacheDataset):
             slice_cache.extend(slices)
             slices_nums.append(slices_num)
         return slice_cache, slices_nums
-
-    # There's an issue with random InvertibleTransform pushing entries in <key>_transforms, leading to lists with
-    # different lengths which causes problem in list_data_collate.
-    # This issue has been resolved in https://github.com/Project-MONAI/MONAI/pull/2121 but has not been released in
-    # stable version yet. This overridden function may not be required in future versions of monai.
-    def _transform(self, index: int):
-        # load data from cache and execute from the first random transform
-        start_run = False
-        if self._cache is None:
-            raise ValueError("Cache must have been filled.")
-        data = self._cache[index]
-        if not isinstance(self.transform, Compose):
-            raise ValueError("transform must be an instance of monai.transforms.Compose.")
-        for _transform in self.transform.transforms:
-            if start_run or isinstance(_transform, Randomizable) or not isinstance(_transform, Transform):
-                # only need to deep copy data on first non-deterministic transform
-                if not start_run:
-                    start_run = True
-                    data = deepcopy(data)
-                data = apply_transform(_transform, data)
-        return data
 
     def get_weights(self):
         if self.weight_slices is not None:
