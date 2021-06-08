@@ -15,11 +15,13 @@ from tqdm import tqdm
 from optimizers import get_optimizer
 from util import \
     AverageMeter, adjust_learning_rate, warmup_learning_rate, save_checkpoint, set_up_logger, log_parameters
-from networks import get_model
+from networks import SegAuxModel
 from losses import SupConLoss
 from data.datasets import CachePartDataset, CacheSliceDataset
 from data.samplers import MultiDomainBatchSampler
 from data.VS_SEG import get_encoder_train_transforms, get_encoder_val_transforms, get_data, data_cfg
+
+from networks.model_factory import SegAuxModel
 
 
 def parse_option():
@@ -194,8 +196,21 @@ def set_loader(opt):
 
 
 def set_model(opt):
-    model = get_model(opt, mode="encoder+projection")
-    criterion = SupConLoss(temperature=opt.temp)
+    model = SegAuxModel(mode="encoder+projector+classifier",
+                        base_args={"in_channels": opt.in_channels,
+                                   "classes_num": opt.classes_num,
+                                   "model": opt.model,
+                                   "size": opt.size,
+                                   },
+                        enc_proj_args={"head": "mlp", "feat_dim": 128},
+                        classifiers_args={"outputs_sizes": [opt.n_parts, opt.classes_num],
+                                          "detach": [True, True]
+                                          },
+                        )
+    criteria = torch.nn.ModuleDict()
+    criteria["ssl"] = SupConLoss(temperature=opt.temp)
+    criteria["partitions"] = torch.nn.CrossEntropyLoss()
+    criteria["classes"] = torch.nn.BCEWithLogitsLoss()
 
     # enable synchronized Batch Normalization
     if opt.syncBN:
@@ -205,12 +220,12 @@ def set_model(opt):
         if torch.cuda.device_count() > 1:
             model = torch.nn.DataParallel(model)
         model = model.cuda()
-        criterion = criterion.cuda()
+        criteria = criteria.cuda()
         cudnn.benchmark = True
 
     optimizer = get_optimizer(model.parameters(), opt)
 
-    return model, criterion, optimizer
+    return model, criteria, optimizer
 
 
 def check_train_data(train_loader, opt, max_samples=None):
@@ -277,7 +292,7 @@ def check_val_data(data_loader, opt, name, max_samples=None):
             plt.savefig(os.path.join(samples_path, f"batch_{idx}_item_{i+1}_vol_{vol_idx+1}_slice_{slice_idx+1}.png"))
 
 
-def train(train_loader, model, criterion, optimizer, epoch, opt):
+def train(train_loader, model, criteria, optimizer, epoch, opt):
     """one epoch training"""
     model.train()
 
@@ -307,7 +322,7 @@ def train(train_loader, model, criterion, optimizer, epoch, opt):
         # warm-up learning rate
         warmup_learning_rate(opt, epoch, idx, len(train_loader), optimizer)
 
-        # compute loss
+        # compute loss_ss
         s = source_images.shape
         source_images = source_images.reshape(s[0]*s[1], s[2], s[3], s[4])
         t = target_images.shape
@@ -315,17 +330,18 @@ def train(train_loader, model, criterion, optimizer, epoch, opt):
 
         # SOURCE DOMAIN
         source_features = model(source_images)
-        source_features = source_features.reshape(s[0], s[1], -1)
-        source_loss = criterion(source_features, source_labels)
+        source_features = source_features["encoder_projector"].reshape(s[0], s[1], -1)
+        source_loss = criteria["ssl"](source_features, source_labels)
 
         # TARGET DOMAIN
         target_features = model(target_images)
-        target_features = target_features.reshape(t[0], t[1], -1)
-        target_loss = criterion(target_features, target_labels)
+        target_features = target_features["encoder_projector"].reshape(t[0], t[1], -1)
+        target_loss = criteria["ssl"](target_features, target_labels)
 
         # CROSS-DOMAIN
         if epoch > opt.in_domain:
-            all_features = torch.cat((source_features, target_features), dim=0)
+            all_features = torch.cat((source_features,
+                                      target_features), dim=0)
             all_labels = torch.cat((source_labels, target_labels), dim=0)
             mask_all = torch.eq(all_labels, all_labels.T).float()
             # mask-out all in-domain positives
@@ -335,11 +351,11 @@ def train(train_loader, model, criterion, optimizer, epoch, opt):
             # mask-out all in-domain negatives
             neg_mask_all[:bsz, :bsz] = 0
             neg_mask_all[bsz:, bsz:] = 0
-            cross_loss = criterion(all_features, mask=mask_all, neg_mask=neg_mask_all)
+            cross_loss = criteria["ssl"](all_features, mask=mask_all, neg_mask=neg_mask_all)
         else:
             cross_loss = torch.tensor(0).to(source_loss.device)
 
-        # total loss
+        # total loss_ss
         loss = source_loss + target_loss + cross_loss
 
         # update metric
@@ -367,12 +383,12 @@ def train(train_loader, model, criterion, optimizer, epoch, opt):
             # calculate current and average Normalized Mean Distance
             nmd = torch.dist(mean_source, mean_target, 2).item()
             nmd_avg = torch.dist(sources.avg, targets.avg, 2).item()
-            opt.logger.info(f"[{epoch}][{idx+1}/{len(train_loader)}]\t" +
-                f"BT {batch_time.val:.3f} ({batch_time.avg:.3f})\t" +
-                f"DT {data_time.val:.3f} ({data_time.avg:.3f})\t" +
-                f"Loss {losses.val:06.3f} <{', '.join(f'{pl.item():.3f}' for pl in partial_losses.val)}> " +
-                f"({losses.avg:06.3f} <{', '.join(f'{pl.item():.3f}' for pl in partial_losses.avg)}>)\t" +
-                f"NMD {nmd:.3f} ({nmd_avg:.3f})")
+            opt.logger.info(f"[{epoch}][{idx + 1}/{len(train_loader)}]\t" +
+                            f"BT {batch_time.val:.3f} ({batch_time.avg:.3f})\t" +
+                            f"DT {data_time.val:.3f} ({data_time.avg:.3f})\t" +
+                            f"Loss {losses.val:06.3f} <{', '.join(f'{pl.item():.3f}' for pl in partial_losses.val)}> " +
+                            f"({losses.avg:06.3f} <{', '.join(f'{pl.item():.3f}' for pl in partial_losses.avg)}>)\t" +
+                            f"NMD {nmd:.3f} ({nmd_avg:.3f})")
 
     nmd_avg = torch.dist(sources.avg, targets.avg, 2).item()
     return losses.avg, {name: pl.item() for name, pl in zip(["source", "target", "cross"], partial_losses.avg)}, nmd_avg
@@ -389,7 +405,7 @@ def validate(source_val_loader, target_val_loader, model):
             if torch.cuda.is_available():
                 images = images.cuda(non_blocking=True)
             features = model(images)
-            source_features.append(features)
+            source_features.append(features["encoder_projector"])
         source_features = torch.cat(source_features, dim=0)
 
         target_features = []
@@ -398,7 +414,7 @@ def validate(source_val_loader, target_val_loader, model):
             if torch.cuda.is_available():
                 images = images.cuda(non_blocking=True)
             features = model(images)
-            target_features.append(features)
+            target_features.append(features["encoder_projector"])
         target_features = torch.cat(target_features, dim=0)
 
         mean_source = torch.mean(source_features, dim=0)
@@ -427,7 +443,7 @@ def main():
     train_loader, source_val_loader, target_val_loader = set_loader(opt)
 
     # build model, criterion and optimizer
-    model, criterion, optimizer = set_model(opt)
+    model, criteria, optimizer = set_model(opt)
 
     if opt.debug:
         check_train_data(train_loader, opt, max_samples=200)
@@ -440,7 +456,7 @@ def main():
 
         # train for one epoch
         time1 = time.time()
-        loss, partial_losses, nmd = train(train_loader, model, criterion, optimizer, epoch, opt)
+        loss, partial_losses, nmd = train(train_loader, model, criteria, optimizer, epoch, opt)
         time2 = time.time()
         val_nmd = validate(source_val_loader, target_val_loader, model)
         time3 = time.time()
@@ -470,4 +486,6 @@ def main():
 if __name__ == '__main__':
     # if torch.cuda.device_count() > 1:
     #     torch.multiprocessing.set_start_method('spawn')
+
+
     main()

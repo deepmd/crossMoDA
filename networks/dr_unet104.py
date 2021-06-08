@@ -2,7 +2,6 @@ from itertools import chain
 
 import torch
 from torch import nn
-from .projection import Projection
 from typing import Union, Sequence, Tuple
 import numpy as np
 
@@ -207,41 +206,45 @@ class DRUNet104(nn.Module):
                  init_filters,
                  layers,
                  dropout=0,
-                 use_decoder=False,
-                 head='mlp',
-                 feat_dim=128,
+                 use_decoder={"projector": False, "index_decoder_block": -1, "output": False},
                  use_conv_final=True
                  ):
         super().__init__()
         self.use_conv_final = use_conv_final
-        self.use_decoder = use_decoder
-        if not self.use_decoder:
-            self.projection = Projection(head=head, dim_in=2048, feat_dim=feat_dim)
+        self.use_decoder_projector = use_decoder["projector"]
+        self.use_decoder_output = use_decoder["output"]
+        self.index = use_decoder["index_decoder_block"]
 
         # for init_filters=16: filters = [64, 128, 256, 512, 1024, 2048]
-        filters = [init_filters * 4 * 2 ** i for i in range(len(layers))]
+        self.filters = [init_filters * 4 * 2 ** i for i in range(len(layers))]
 
-        self.input_bottleneck_block = InputBottleneckBlock(in_channels, filters[0])
-        self.bottleneck_block = BottleneckBlock(filters[0], filters[0])
+        num_ups_in_decoder = len(self.filters) - 1
+        if self.use_decoder_projector:
+            if -self.index > num_ups_in_decoder or self.index >= 0:
+                raise ValueError(f"Decoder has only {num_ups_in_decoder} blocks."
+                                 f" [-1, -{num_ups_in_decoder}] indices are valid.")
 
-        self.down_layer1 = self._make_down_layer(filters[0], filters[1], layers[1], dropout)
-        self.down_layer2 = self._make_down_layer(filters[1], filters[2], layers[2], dropout)
-        self.down_layer3 = self._make_down_layer(filters[2], filters[3], layers[3], dropout)
-        self.down_layer4 = self._make_down_layer(filters[3], filters[4], layers[4], dropout)
-        self.bridge = self._make_down_layer(filters[4], filters[5], layers[5], dropout)
+        self.input_bottleneck_block = InputBottleneckBlock(in_channels, self.filters[0])
+        self.bottleneck_block = BottleneckBlock(self.filters[0], self.filters[0])
 
-        if self.use_decoder:
-            self.up_layer1 = self._make_up_layer(filters[5], filters[4]//2, dropout)
-            self.up_layer2 = self._make_up_layer(filters[4]//2, filters[3]//2, dropout)
-            self.up_layer3 = self._make_up_layer(filters[3]//2, filters[2]//2, dropout)
-            self.up_layer4 = self._make_up_layer(filters[2]//2, filters[1]//2, dropout)
-            self.up_layer5 = self._make_up_layer(filters[1]//2, filters[0]//2, dropout)
-            self.bn = nn.BatchNorm2d(filters[0]//2)
+        self.down_layer1 = self._make_down_layer(self.filters[0], self.filters[1], layers[1], dropout)
+        self.down_layer2 = self._make_down_layer(self.filters[1], self.filters[2], layers[2], dropout)
+        self.down_layer3 = self._make_down_layer(self.filters[2], self.filters[3], layers[3], dropout)
+        self.down_layer4 = self._make_down_layer(self.filters[3], self.filters[4], layers[4], dropout)
+        self.bridge = self._make_down_layer(self.filters[4], self.filters[5], layers[5], dropout)
+
+        if self.use_decoder_projector or self.use_decoder_output:
+            self.up_layer1 = self._make_up_layer(self.filters[5], self.filters[4]//2, dropout)
+            self.up_layer2 = self._make_up_layer(self.filters[4]//2, self.filters[3]//2, dropout)
+            self.up_layer3 = self._make_up_layer(self.filters[3]//2, self.filters[2]//2, dropout)
+            self.up_layer4 = self._make_up_layer(self.filters[2]//2, self.filters[1]//2, dropout)
+            self.up_layer5 = self._make_up_layer(self.filters[1]//2, self.filters[0]//2, dropout)
+            self.bn = nn.BatchNorm2d(self.filters[0]//2)
             self.relu = nn.ReLU(inplace=True)
 
             # Output layer
             if self.use_conv_final:
-                self.conv_final = conv1x1(filters[0]//2, out_channels)
+                self.conv_final = conv1x1(self.filters[0]//2, out_channels)
 
     def _make_up_layer(self, in_planes, out_planes, dropout):
         layers = list()
@@ -270,63 +273,87 @@ class DRUNet104(nn.Module):
         for param in chain.from_iterable(layer.parameters() for layer in encoder_layers):
             param.requires_grad = False
 
-    def forward(self, x):
+    def get_encoder_output_size(self, image_size):
+        height, width = image_size if isinstance(image_size, tuple) else (image_size, image_size)
+        # Note that Bridge layer doesn't change dimensions of inputs.
+        num_downs_in_encoder = len(self.filters) - 1
+        height_en_feat = height // 2 ** num_downs_in_encoder
+        width_en_feat = width // 2 ** num_downs_in_encoder
+        channels_en_feat = self.filters[-1]
+        return {'channels': channels_en_feat, 'height': height_en_feat, 'width': width_en_feat}
+
+    def get_decoder_output_size(self, image_size, index_decoder_block):
+        height, width = image_size if isinstance(image_size, tuple) else (image_size, image_size)
+        num_ups_in_decoder = len(self.filters) - 1
+        if -index_decoder_block > num_ups_in_decoder or index_decoder_block >= 0:
+            raise ValueError(f"Decoder has only {num_ups_in_decoder} blocks."
+                             f" Expected range of indices is [-1, -{num_ups_in_decoder}].")
+
+        # How many upsample occure from index_decoder_block until end of decoder
+        num_ups_until_model_output = abs(1+index_decoder_block)
+        height_dec_feat = height // 2 ** num_ups_until_model_output
+        width_dec_feat = width // 2 ** num_ups_until_model_output
+
+        # Reverse the encoder filters list to gain decoder filters list.
+        up_filters = self.filters[::-1]
+        channels_dec_feat = up_filters[index_decoder_block] // 2
+        return {'channels': channels_dec_feat, 'height': height_dec_feat, 'width': width_dec_feat}
+
+    def forward(self, x, show_size=False):
         # Level 1
         e0 = self.input_bottleneck_block(x)
         e0 = self.bottleneck_block(e0)
-        # print(e0.size())
-
+        if show_size: print('e0=', e0.size())
         # Level 2
         e1 = self.down_layer1(e0)
-        # print(e1.size())
-
+        if show_size: print('e1=', e1.size())
         # Level 3
         e2 = self.down_layer2(e1)
-        # print(e2.size())
-
+        if show_size: print('e2=', e2.size())
         # Level 4
         e3 = self.down_layer3(e2)
-        # print(e3.size())
-
+        if show_size: print('e3=', e3.size())
         # Level 5
         e4 = self.down_layer4(e3)
-        # print(e4.size())
-
+        if show_size: print('e4=', e4.size())
         # Bridge
         e5 = self.bridge(e4)
-        # print(e5.size())
+        if show_size: print('e5=', e5.size())
 
-        if not self.use_decoder:
-            x = self.projection(e5)
-            return x
+        if self.use_decoder_projector or self.use_decoder_output:
+            # Level 5
+            d0 = self.up_layer1([e5, e4])
+            if show_size: print('d0=', d0.size())
+            if self.use_decoder_projector and self.index == -5:
+                return d0
+            # Level 4
+            d1 = self.up_layer2([d0, e3])
+            if show_size: print('d1=', d1.size())
+            if self.use_decoder_projector and self.index == -4:
+                return d1
+            # Level 3
+            d2 = self.up_layer3([d1, e2])
+            if show_size: print('d2=', d2.size())
+            if self.use_decoder_projector and self.index == -3:
+                return d2
+            # Level 2
+            d3 = self.up_layer4([d2, e1])
+            if show_size: print('d3=', d3.size())
+            if self.use_decoder_projector and self.index == -2:
+                return d3
+            # Level 1
+            d4 = self.up_layer5([d3, e0])
+            x = self.bn(d4)
+            x = self.relu(x)
+            if show_size: print('d4=', d4.size())
+            if self.use_decoder_projector and self.index == -1:
+                return x
 
-        # Level 5
-        d0 = self.up_layer1([e5, e4])
-        # print(d0.size())
+            # Output layer
+            if self.use_conv_final:
+                x = self.conv_final(x)
 
-        # Level 4
-        d1 = self.up_layer2([d0, e3])
-        # print(d1.size())
-
-        # Level 3
-        d2 = self.up_layer3([d1, e2])
-        # print(d2.size())
-
-        # Level 2
-        d3 = self.up_layer4([d2, e1])
-        # print(d3.size())
-
-        # Level 1
-        d4 = self.up_layer5([d3, e0])
-        x = self.bn(d4)
-        x = self.relu(x)
-        # print(x.size())
-
-        # Output layer
-        if self.use_conv_final:
-            x = self.conv_final(x)
-
-        return x
+        return x if self.use_decoder_output else e5
 
 
 if __name__ == '__main__':
@@ -336,11 +363,15 @@ if __name__ == '__main__':
                       init_filters=16,
                       layers=[2, 3, 3, 5, 14, 4],
                       dropout=0.2,
-                      use_decoder=False,
-                      head='mlp',
-                      feat_dim=128,
+                      use_decoder={"projector": False, "index_decoder_block": -1, "output": False},
+                      use_conv_final=False,
                       ).to(device)
 
+    en_size = model.get_encoder_output_size(image_size=352)
+    print('encoder_output_size=', en_size)
+    dec_size = model.get_decoder_output_size(image_size=352, index_decoder_block=-1)
+    print('decoder_output_size=', dec_size)
+
     x = torch.ones([3, 1, 352, 352]).to(device)
-    out = model(x)
+    out = model(x, show_size=True)
     print('out=', out.size())

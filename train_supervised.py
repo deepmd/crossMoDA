@@ -23,7 +23,7 @@ from metrics import compute_dice_score, compute_average_symmetric_surface_distan
 from optimizers import get_optimizer
 from util import \
     AverageMeter, adjust_learning_rate, warmup_learning_rate, save_checkpoint, load_model, set_up_logger, log_parameters
-from networks import get_model
+from networks import SegAuxModel
 from data.datasets import CacheSliceDataset
 from data.VS_SEG import get_supervised_train_transforms, get_supervised_val_transforms, get_data, data_cfg
 
@@ -250,7 +250,13 @@ def set_loader(opt):
 
 
 def set_model(opt):
-    model = get_model(opt, mode="encoder+decoder")
+    model = SegAuxModel(mode="encoder+decoder",
+                        base_args={"in_channels": opt.in_channels,
+                                   "classes_num": opt.classes_num,
+                                   "model": opt.model,
+                                   "size": opt.size,
+                                   },
+                        )
 
     if opt.loss == "HDLoss":
         criterion = HardnessWeightedDiceLoss(to_onehot_y=True, softmax=True, hardness_lambda=opt.hardness_lambda)
@@ -264,10 +270,10 @@ def set_model(opt):
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
     if opt.ckpt is not None:
-        load_model(model, opt, opt.ckpt)
+        load_model(model.base, opt, opt.ckpt)
 
     if opt.freeze_enc:
-        model.freeze_encoder()
+        model.base.freeze_encoder()
 
     if torch.cuda.is_available():
         if torch.cuda.device_count() > 1:
@@ -343,12 +349,12 @@ def train(train_loader, model, criterion, optimizer, epoch, opt):
 
         # compute loss
         logits = model(images)
-        loss = criterion(logits, labels)
+        loss = criterion(logits["decoder_output"], labels)
 
         # update metric
         with torch.no_grad():
             losses.update(loss.item(), bsz)
-            dsc, valid_n = compute_dice_score(logits, labels)
+            dsc, valid_n = compute_dice_score(logits["decoder_output"], labels)
             dscs.update(dsc, valid_n)
 
         # SGD
@@ -399,7 +405,7 @@ def validate(source_val_loader, target_val_loader, model, opt):
                 logits = model(images)
                 unique_vol_idxs = torch.unique(vol_idxs)
                 for vol_idx in unique_vol_idxs.tolist():
-                    volume_logits[vol_idx].append(logits[vol_idxs == vol_idx])
+                    volume_logits[vol_idx].append(logits["decoder_output"][vol_idxs == vol_idx])
                     volume_labels[vol_idx].append(labels[vol_idxs == vol_idx])
                 if len(volume_logits) > 1:
                     for vol_idx in sorted(volume_logits.keys())[:-1]:
