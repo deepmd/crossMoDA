@@ -12,6 +12,7 @@ from monai.data import DataLoader
 from matplotlib import pyplot as plt
 from tqdm import tqdm
 
+from metrics import compute_f1_score
 from optimizers import get_optimizer
 from util import \
     AverageMeter, adjust_learning_rate, warmup_learning_rate, save_checkpoint, set_up_logger, log_parameters
@@ -20,8 +21,6 @@ from losses import SupConLoss
 from data.datasets import CachePartDataset, CacheSliceDataset
 from data.samplers import MultiDomainBatchSampler
 from data.VS_SEG import get_encoder_train_transforms, get_encoder_val_transforms, get_data, data_cfg
-
-from networks.model_factory import SegAuxModel
 
 
 def parse_option():
@@ -81,6 +80,8 @@ def parse_option():
                         help='using synchronized batch normalization')
     parser.add_argument('--warm', action='store_true',
                         help='warm-up for large batch training')
+    parser.add_argument('--classifier_eval', action='store_true',
+                        help='adding two auxiliary linear classifiers to predict roi existence and partition index.')
     parser.add_argument('--trial', type=str, default='0',
                         help='id for recording multiple runs')
 
@@ -145,6 +146,7 @@ def set_loader(opt):
     source_train_transform, target_train_transform = get_encoder_train_transforms(opt)
     source_val_transform, target_val_transform = get_encoder_val_transforms(opt)
     (source_train_data, target_train_data), (source_val_data, target_val_data), _ = get_data(opt)
+    keys = ["image"] if not opt.classifier_eval else ["image", "label"]
 
     # train data
     if len(source_train_data) != len(target_train_data):
@@ -152,10 +154,10 @@ def set_loader(opt):
                          f"the length of target domain train data ({len(target_train_data)}).")
     logger.info("Caching source training data ...")
     source_train_dataset = CachePartDataset(data=source_train_data, transform=source_train_transform,
-                                            parts_num=opt.n_parts, keys=["image"], num_workers=opt.num_workers//3)
+                                            parts_num=opt.n_parts, keys=keys, num_workers=1)
     logger.info("Caching target training data ...")
     target_train_dataset = CachePartDataset(data=target_train_data, transform=target_train_transform,
-                                            parts_num=opt.n_parts, keys=["image"], num_workers=opt.num_workers//3)
+                                            parts_num=opt.n_parts, keys=keys, num_workers=1)
     train_dataset = ConcatDataset([source_train_dataset, target_train_dataset])
     batch_sampler = MultiDomainBatchSampler(
         domains_lengths=[len(source_train_data), len(target_train_data)],
@@ -174,18 +176,18 @@ def set_loader(opt):
     # validation data
     logger.info("Caching source validation data ...")
     source_val_dataset = CacheSliceDataset(data=source_val_data, transform=source_val_transform,
-                                           keys=["image"], num_workers=opt.num_workers//3)
+                                           keys=keys, num_workers=opt.num_workers//3)
     logger.info("Caching target validation data ...")
     target_val_dataset = CacheSliceDataset(data=target_val_data, transform=target_val_transform,
-                                           keys=["image"], num_workers=opt.num_workers//3)
+                                           keys=keys, num_workers=opt.num_workers//3)
     source_val_loader = DataLoader(
         dataset=source_val_dataset,
-        batch_size=math.ceil(opt.batch_size),
+        batch_size=opt.batch_size,
         num_workers=opt.num_workers,
         pin_memory=True)
     target_val_loader = DataLoader(
         dataset=target_val_dataset,
-        batch_size=math.ceil(opt.batch_size),
+        batch_size=opt.batch_size,
         num_workers=opt.num_workers,
         pin_memory=True)
     logger.info(f"Summary of the validation data:")
@@ -196,21 +198,36 @@ def set_loader(opt):
 
 
 def set_model(opt):
-    model = SegAuxModel(mode="encoder+projector+classifier",
-                        base_args={"in_channels": opt.in_channels,
-                                   "classes_num": opt.classes_num,
-                                   "model": opt.model,
-                                   "size": opt.size,
-                                   },
-                        enc_proj_args={"head": "mlp", "feat_dim": 128},
-                        classifiers_args={"outputs_sizes": [opt.n_parts, opt.classes_num],
-                                          "detach": [True, True]
-                                          },
-                        )
     criteria = torch.nn.ModuleDict()
-    criteria["ssl"] = SupConLoss(temperature=opt.temp)
-    criteria["partitions"] = torch.nn.CrossEntropyLoss()
-    criteria["classes"] = torch.nn.BCEWithLogitsLoss()
+    if not opt.classifier_eval:
+        model = SegAuxModel(
+            mode="encoder+projector",
+            base_args={
+                "in_channels": opt.in_channels,
+                "classes_num": opt.classes_num,
+                "model": opt.model,
+                "size": opt.size,
+            }
+        )
+        criteria["ssl"] = SupConLoss(temperature=opt.temp)
+    else:
+        model = SegAuxModel(
+            mode="encoder+projector+classifier",
+            base_args={
+                "in_channels": opt.in_channels,
+                "classes_num": opt.classes_num,
+                "model": opt.model,
+                "size": opt.size,
+            },
+            enc_proj_args={"head": "mlp", "feat_dim": 128},
+            classifiers_args={
+                "outputs_sizes": [opt.n_parts, opt.classes_num-1],
+                "detach": [True, True]
+            }
+        )
+        criteria["ssl"] = SupConLoss(temperature=opt.temp)
+        criteria["partitions"] = torch.nn.CrossEntropyLoss()
+        criteria["classes"] = torch.nn.BCEWithLogitsLoss()
 
     # enable synchronized Batch Normalization
     if opt.syncBN:
@@ -298,6 +315,7 @@ def train(train_loader, model, criteria, optimizer, epoch, opt):
 
     batch_time = AverageMeter()
     data_time = AverageMeter()
+    cls_losses = AverageMeter()
     partial_losses = AverageMeter()
     losses = AverageMeter()
     sources = AverageMeter()
@@ -309,15 +327,15 @@ def train(train_loader, model, criteria, optimizer, epoch, opt):
 
         bsz = batch_data["image"].shape[0] // 2
         source_images = batch_data["image"][:bsz]
-        source_labels = batch_data["part_idx"][:bsz]
+        source_part_idxs = batch_data["part_idx"][:bsz]
         target_images = batch_data["image"][bsz:]
-        target_labels = batch_data["part_idx"][bsz:]
+        target_part_idxs = batch_data["part_idx"][bsz:]
 
         if torch.cuda.is_available():
             source_images = source_images.cuda(non_blocking=True)
-            source_labels = source_labels.cuda(non_blocking=True)
+            source_part_idxs = source_part_idxs.cuda(non_blocking=True)
             target_images = target_images.cuda(non_blocking=True)
-            target_labels = target_labels.cuda(non_blocking=True)
+            target_part_idxs = target_part_idxs.cuda(non_blocking=True)
 
         # warm-up learning rate
         warmup_learning_rate(opt, epoch, idx, len(train_loader), optimizer)
@@ -329,21 +347,20 @@ def train(train_loader, model, criteria, optimizer, epoch, opt):
         target_images = target_images.reshape(t[0]*t[1], t[2], t[3], t[4])
 
         # SOURCE DOMAIN
-        source_features = model(source_images)
-        source_features = source_features["encoder_projector"].reshape(s[0], s[1], -1)
-        source_loss = criteria["ssl"](source_features, source_labels)
+        source_output = model(source_images)
+        source_features = source_output["encoder_projector"].reshape(s[0], s[1], -1)
+        source_loss = criteria["ssl"](source_features, source_part_idxs)
 
         # TARGET DOMAIN
-        target_features = model(target_images)
-        target_features = target_features["encoder_projector"].reshape(t[0], t[1], -1)
-        target_loss = criteria["ssl"](target_features, target_labels)
+        target_output = model(target_images)
+        target_features = target_output["encoder_projector"].reshape(t[0], t[1], -1)
+        target_loss = criteria["ssl"](target_features, target_part_idxs)
 
         # CROSS-DOMAIN
         if epoch > opt.in_domain:
-            all_features = torch.cat((source_features,
-                                      target_features), dim=0)
-            all_labels = torch.cat((source_labels, target_labels), dim=0)
-            mask_all = torch.eq(all_labels, all_labels.T).float()
+            all_features = torch.cat((source_features, target_features))
+            all_prat_idxs = torch.cat((source_part_idxs, target_part_idxs))
+            mask_all = torch.eq(all_prat_idxs, all_prat_idxs.T).float()
             # mask-out all in-domain positives
             mask_all[:bsz, :bsz] = 0
             mask_all[bsz:, bsz:] = 0
@@ -355,11 +372,36 @@ def train(train_loader, model, criteria, optimizer, epoch, opt):
         else:
             cross_loss = torch.tensor(0).to(source_loss.device)
 
-        # total loss_ss
+        # CLASSIFIER
+        if opt.classifier_eval:
+            # all_labels = batch_data["label"]
+            # all_labels = torch.repeat_interleave(all_labels, repeats=2, dim=0)  # there are 2 views for each image
+            # if torch.cuda.is_available():
+            #     all_labels = all_labels.cuda(non_blocking=True)
+            # all_prat_idxs = torch.cat((source_part_idxs, target_part_idxs))
+            # all_prat_idxs = torch.repeat_interleave(all_prat_idxs, repeats=2)  # no dim used to flatten output
+            # all_classifier0_output = torch.cat((source_output["classifier0"], target_output["classifier0"]))
+            # all_classifier1_output = torch.cat((source_output["classifier1"], target_output["classifier1"]))
+            # part_idx_loss = criteria["partitions"](all_classifier0_output, all_prat_idxs)
+            # label_loss = criteria["classes"](all_classifier1_output, all_labels)
+            source_labels = batch_data["label"][:bsz]
+            source_labels = torch.repeat_interleave(source_labels, repeats=2, dim=0)  # there are 2 views for each image
+            if torch.cuda.is_available():
+                source_labels = source_labels.cuda(non_blocking=True)
+            source_part_idxs = torch.repeat_interleave(source_part_idxs, repeats=2)  # no dim used to flatten output
+            part_idx_loss = criteria["partitions"](source_output["classifier0"], source_part_idxs)
+            label_loss = criteria["classes"](source_output["classifier1"], source_labels)
+        else:
+            part_idx_loss = torch.tensor(0).to(source_loss.device)
+            label_loss = torch.tensor(0).to(source_loss.device)
+
+        # total loss
         loss = source_loss + target_loss + cross_loss
+        total_loss = loss + part_idx_loss + label_loss
 
         # update metric
-        partial_losses.update(torch.stack([source_loss, target_loss, cross_loss], dim=0), bsz)
+        cls_losses.update(torch.stack([part_idx_loss, label_loss]), bsz)
+        partial_losses.update(torch.stack([source_loss, target_loss, cross_loss]), bsz)
         losses.update(loss.item(), bsz)
 
         # keeping source and target features avg
@@ -371,7 +413,7 @@ def train(train_loader, model, criteria, optimizer, epoch, opt):
 
         # SGD
         optimizer.zero_grad()
-        loss.backward()
+        total_loss.backward()
         optimizer.step()
 
         # measure elapsed time
@@ -383,45 +425,68 @@ def train(train_loader, model, criteria, optimizer, epoch, opt):
             # calculate current and average Normalized Mean Distance
             nmd = torch.dist(mean_source, mean_target, 2).item()
             nmd_avg = torch.dist(sources.avg, targets.avg, 2).item()
+            cls_loss_info = \
+                f"Loss-Cls {', '.join(f'{cl.item():.3f}' for cl in cls_losses.avg)}\t" if opt.classifier_eval else ""
             opt.logger.info(f"[{epoch}][{idx + 1}/{len(train_loader)}]\t" +
                             f"BT {batch_time.val:.3f} ({batch_time.avg:.3f})\t" +
                             f"DT {data_time.val:.3f} ({data_time.avg:.3f})\t" +
                             f"Loss {losses.val:06.3f} <{', '.join(f'{pl.item():.3f}' for pl in partial_losses.val)}> " +
                             f"({losses.avg:06.3f} <{', '.join(f'{pl.item():.3f}' for pl in partial_losses.avg)}>)\t" +
+                            cls_loss_info +
                             f"NMD {nmd:.3f} ({nmd_avg:.3f})")
 
     nmd_avg = torch.dist(sources.avg, targets.avg, 2).item()
-    return losses.avg, {name: pl.item() for name, pl in zip(["source", "target", "cross"], partial_losses.avg)}, nmd_avg
+    return losses.avg, \
+           {name: pl.item() for name, pl in zip(["source", "target", "cross"], partial_losses.avg)}, \
+           {name: cl.item() for name, cl in zip(["partitions", "classes"], cls_losses.avg)}, \
+           nmd_avg
 
 
-def validate(source_val_loader, target_val_loader, model):
+def validate(source_val_loader, target_val_loader, model, opt):
     """validation"""
     model.eval()
 
+    source_features, source_cls0, source_gt0, source_cls1, source_gt1 = [], [], [], [], []
+    target_features, target_cls0, target_gt0, target_cls1, target_gt1 = [], [], [], [], []
+
+    items = ((source_val_loader, source_features, source_cls0, source_gt0, source_cls1, source_gt1),
+             (target_val_loader, target_features, target_cls0, target_gt0, target_cls1, target_gt1))
+
     with torch.no_grad():
-        source_features = []
-        for batch_data in source_val_loader:
-            images = batch_data["image"]
-            if torch.cuda.is_available():
-                images = images.cuda(non_blocking=True)
-            features = model(images)
-            source_features.append(features["encoder_projector"])
-        source_features = torch.cat(source_features, dim=0)
+        for data_loader, features, cls0, gt0, cls1, gt1 in items:
+            for batch_data in data_loader:
+                images = batch_data["image"]
+                if torch.cuda.is_available():
+                    images = images.cuda(non_blocking=True)
+                outputs = model(images)
+                features.append(outputs["encoder_projector"])
+                if opt.classifier_eval:
+                    cls0.append(outputs["classifier0"])
+                    cls1.append(outputs["classifier1"])
+                    part_idx = batch_data["part_idx"]
+                    label = batch_data["label"]
+                    if torch.cuda.is_available():
+                        part_idx = part_idx.cuda(non_blocking=True)
+                        label = label.cuda(non_blocking=True)
+                    gt0.append(part_idx)
+                    gt1.append(label)
 
-        target_features = []
-        for batch_data in target_val_loader:
-            images = batch_data["image"]
-            if torch.cuda.is_available():
-                images = images.cuda(non_blocking=True)
-            features = model(images)
-            target_features.append(features["encoder_projector"])
-        target_features = torch.cat(target_features, dim=0)
-
-        mean_source = torch.mean(source_features, dim=0)
-        mean_target = torch.mean(target_features, dim=0)
+        mean_source = torch.mean(torch.cat(source_features), dim=0)
+        mean_target = torch.mean(torch.cat(target_features), dim=0)
         nmd = torch.dist(mean_source, mean_target, 2).item()
 
-        return nmd
+        cls_scores = dict()
+        cls_avg_score = 0
+        if opt.classifier_eval:
+            cls_scores = {
+                "f1_source_partitions": compute_f1_score(torch.cat(source_cls0), torch.cat(source_gt0)),
+                "f1_source_classes": compute_f1_score(torch.cat(source_cls1), torch.cat(source_gt1), multilabel=True),
+                "f1_target_partitions": compute_f1_score(torch.cat(target_cls0), torch.cat(target_gt0)),
+                "f1_target_classes": compute_f1_score(torch.cat(target_cls1), torch.cat(target_gt1), multilabel=True)
+            }
+            cls_avg_score = sum(cls_scores.values())/4
+
+        return nmd, cls_scores, cls_avg_score
 
 
 def main():
@@ -456,20 +521,37 @@ def main():
 
         # train for one epoch
         time1 = time.time()
-        loss, partial_losses, nmd = train(train_loader, model, criteria, optimizer, epoch, opt)
+        loss, partial_losses, cls_losses, nmd = train(train_loader, model, criteria, optimizer, epoch, opt)
         time2 = time.time()
-        val_nmd = validate(source_val_loader, target_val_loader, model)
+        val_nmd, cls_scores, cls_avg_score = validate(source_val_loader, target_val_loader, model, opt)
         time3 = time.time()
+        if opt.classifier_eval:
+            cls_loss_info = f"Loss-Cls {', '.join(f'{cl:.3f}' for cl in cls_losses.values())},  "
+            cls_score_info = f"F1-Cls {cls_avg_score:.3f},  "
+        else:
+            cls_loss_info, cls_score_info = "", ""
+            cls_losses, cls_scores = dict(), dict()
+            cls_avg_score = None
         logger.info(f"Epoch {epoch}  Train: Time {(time2 - time1):.2f},  " +
-                    f"Loss {loss:.3f} <{', '.join(f'{pl:.3f}' for pl in partial_losses.values())}>,  NMD {nmd:.3f}")
-        logger.info(f"{' '*(len(str(epoch))+1)}  Validation: Time {(time3 - time2):.2f},  NMD {val_nmd:.3f}")
+                    f"Loss {loss:.3f} <{', '.join(f'{pl:.3f}' for pl in partial_losses.values())}>,  " +
+                    cls_loss_info +
+                    f"NMD {nmd:.3f}")
+        logger.info(f"{' '*(len(str(epoch))+1)}  Validation: Time {(time3 - time2):.2f},  " +
+                    cls_score_info +
+                    f"NMD {val_nmd:.3f}")
 
         # tensorboard logging
         tb_logger.add_scalar('loss/total', loss, epoch)
         for name, p_loss in partial_losses.items():
             tb_logger.add_scalar(f'loss/{name}', p_loss, epoch)
-        tb_logger.add_scalar('metric/nmd', nmd, epoch)
+        for name, c_loss in cls_losses.items():
+            tb_logger.add_scalar(f'loss_cls/{name}', p_loss, epoch)
+        tb_logger.add_scalar('metric/train_nmd', nmd, epoch)
         tb_logger.add_scalar('metric/val_nmd', val_nmd, epoch)
+        if cls_avg_score is not None:
+            tb_logger.add_scalar(f'metric/f1_avg', cls_avg_score, epoch)
+        for name, score in cls_scores.items():
+            tb_logger.add_scalar(f'metric/{name}', score, epoch)
         tb_logger.add_scalar('learning_rate', optimizer.param_groups[0]['lr'], epoch)
 
         if epoch % opt.save_freq == 0:

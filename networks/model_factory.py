@@ -63,9 +63,9 @@ class SegAuxModel(nn.Module):
                                                        feat_dim=enc_proj_args["feat_dim"],
                                                        )
         if self.use_classifier:
-            classifiers = list([])
+            self.classifiers = nn.ModuleList()
             for i, out_size in enumerate(classifiers_args["outputs_sizes"]):
-                classifiers.append(
+                self.classifiers.append(
                     nn.Sequential(
                         nn.AdaptiveAvgPool2d((1, 1)),
                         nn.Flatten(),
@@ -75,7 +75,6 @@ class SegAuxModel(nn.Module):
                         ),
                     )
                 )
-            self.classifiers = nn.Sequential(*classifiers)
 
         if self.use_decoder_projector:
             decoder_output_size = self.base.get_decoder_output_size(base_args["size"],
@@ -157,11 +156,11 @@ if __name__ == '__main__':
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = SegAuxModel(mode="encoder+decoder",
-                        base_model_args={"in_channels": opt.in_channels,
-                                         "classes_num": opt.classes_num,
-                                         "model": opt.model,
-                                         "size": opt.size,
-                                         },
+                        base_args={"in_channels": opt.in_channels,
+                                   "classes_num": opt.classes_num,
+                                   "model": opt.model,
+                                   "size": opt.size,
+                                   },
                         classifiers_args={"outputs_sizes": [opt.n_parts, opt.classes_num],
                                           'detach': [True, True]
                                           },

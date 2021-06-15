@@ -250,13 +250,15 @@ def set_loader(opt):
 
 
 def set_model(opt):
-    model = SegAuxModel(mode="encoder+decoder",
-                        base_args={"in_channels": opt.in_channels,
-                                   "classes_num": opt.classes_num,
-                                   "model": opt.model,
-                                   "size": opt.size,
-                                   },
-                        )
+    model = SegAuxModel(
+        mode="encoder+decoder",
+        base_args={
+            "in_channels": opt.in_channels,
+            "classes_num": opt.classes_num,
+            "model": opt.model,
+            "size": opt.size,
+        }
+    )
 
     if opt.loss == "HDLoss":
         criterion = HardnessWeightedDiceLoss(to_onehot_y=True, softmax=True, hardness_lambda=opt.hardness_lambda)
@@ -348,13 +350,13 @@ def train(train_loader, model, criterion, optimizer, epoch, opt):
         warmup_learning_rate(opt, epoch, idx, len(train_loader), optimizer)
 
         # compute loss
-        logits = model(images)
-        loss = criterion(logits["decoder_output"], labels)
+        logits = model(images)["decoder_output"]
+        loss = criterion(logits, labels)
 
         # update metric
         with torch.no_grad():
             losses.update(loss.item(), bsz)
-            dsc, valid_n = compute_dice_score(logits["decoder_output"], labels)
+            dsc, valid_n = compute_dice_score(logits, labels)
             dscs.update(dsc, valid_n)
 
         # SGD
@@ -409,10 +411,10 @@ def validate(source_val_loader, target_val_loader, model, opt):
                     volume_labels[vol_idx].append(labels[vol_idxs == vol_idx])
                 if len(volume_logits) > 1:
                     for vol_idx in sorted(volume_logits.keys())[:-1]:
-                        vol_logits = torch.cat(volume_logits.pop(vol_idx), dim=0)
+                        vol_logits = torch.cat(volume_logits.pop(vol_idx))
                         vol_logits = torch.movedim(vol_logits, 0, -1)
                         vol_logits = torch.unsqueeze(vol_logits, dim=0)
-                        vol_labels = torch.cat(volume_labels.pop(vol_idx), dim=0)
+                        vol_labels = torch.cat(volume_labels.pop(vol_idx))
                         vol_labels = torch.movedim(vol_labels, 0, -1)
                         vol_labels = torch.unsqueeze(vol_labels, dim=0)
                         dsc, valid_n = compute_dice_score(vol_logits, vol_labels)

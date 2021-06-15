@@ -198,3 +198,55 @@ class RandMultiTransformd(Compose, MapTransform):
                     d[new_key] = deepcopy(d[key])
         d = Compose.__call__(self, d)
         return d
+
+
+class MapSegLabelToClassLabel(MapTransform):
+    def __init__(
+            self,
+            keys: KeysCollection,
+            num_classes: int,
+            include_background: bool = False,
+            allow_missing_keys: bool = False) -> None:
+        MapTransform.__init__(self, keys, allow_missing_keys)
+        self.num_classes = num_classes
+        self.include_background = include_background
+
+    def _map(self, img):
+        labels = range(self.num_classes) if self.include_background else range(1, self.num_classes)
+        if isinstance(img, torch.Tensor):
+            return torch.tensor([torch.any(img == label) for label in labels], dtype=img.dtype)
+        elif isinstance(img, np.ndarray):
+            return np.array([np.any(img == label) for label in labels], dtype=img.dtype)
+        else:
+            raise TypeError(f"Cannot map segmentation labels to classification labels of type {type(img).__name__}.")
+
+    def __call__(self, data: Mapping[Hashable, np.ndarray]) -> Dict[Hashable, np.ndarray]:
+        d = dict(data)
+        for key in self.key_iterator(d):
+            d[key] = self._map(d[key])
+        return d
+
+
+class AddPartitionIndex(Transform):
+    def __init__(
+            self,
+            part_idx_key: str,
+            parts_num: int,
+            vol_size_key: str = "vol_size",
+            slice_idx_key: str = "slice_idx") -> None:
+        self.parts_num = parts_num
+        self.part_idx_key = part_idx_key
+        self.vol_size_key = vol_size_key
+        self.slice_idx_key = slice_idx_key
+
+    def _compute_part_idx(self, vol_size, slice_idx):
+        Neach_section, extras = divmod(vol_size, self.parts_num)
+        section_sizes = np.array(extras * [Neach_section + 1] + (self.parts_num - extras) * [Neach_section])
+        div_points = np.cumsum(section_sizes)
+        part_idx = (slice_idx >= div_points).sum()
+        return part_idx
+
+    def __call__(self, data: Mapping[Hashable, np.ndarray]) -> Dict[Hashable, np.ndarray]:
+        d = dict(data)
+        d[self.part_idx_key] = self._compute_part_idx(d[self.vol_size_key], d[self.slice_idx_key])
+        return d

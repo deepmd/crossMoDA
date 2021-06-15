@@ -6,7 +6,6 @@ from monai.utils import ensure_tuple
 from monai.config.type_definitions import KeysCollection
 from typing import Callable, List, Optional, Sequence, Union, Tuple, Dict
 import numpy as np
-from math import ceil
 
 
 class CachePartDataset(CacheDataset):
@@ -34,7 +33,10 @@ class CachePartDataset(CacheDataset):
             split_items = dict()
             for key in self.keys:
                 if isinstance(item[key], torch.Tensor):
-                    split_items[key] = torch.split(item[key], ceil(item[key].shape[-1]/parts_num), dim=-1)
+                    # follows numpy method in array_split
+                    Neach_section, extras = divmod(item[key].shape[-1], parts_num)
+                    section_sizes = extras * [Neach_section + 1] + (parts_num - extras) * [Neach_section]
+                    split_items[key] = torch.split(item[key], section_sizes, dim=-1)
                 elif isinstance(item[key], np.ndarray):
                     split_items[key] = np.array_split(item[key], parts_num, axis=-1)
                 else:
@@ -111,6 +113,7 @@ class CacheSliceDataset(CacheDataset):
             if slices_idxs is not None:
                 slices['slice_idx'] = slices['slice_idx'][slices_idxs]
             slices['vol_idx'] = np.repeat(idx, slices_num)
+            slices['vol_size'] = np.repeat(slices_num, slices_num)
             if self.copy_other_keys:
                 for other_key in item.keys():
                     if other_key not in (self.keys + stat_keys):
