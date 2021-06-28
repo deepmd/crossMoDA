@@ -370,8 +370,6 @@ def train(train_loader, model, criterion, optimizer, epoch, opt):
 
         # print info
         if (idx + 1) % opt.print_freq == 0:
-            if epoch == 11:
-                epoch += 900
             opt.logger.info(f"[{epoch}][{idx+1}/{len(train_loader)}]\t" +
                 f"BT {batch_time.val:.3f} ({batch_time.avg:.3f})\t" +
                 f"DT {data_time.val:.3f} ({data_time.avg:.3f})\t" +
