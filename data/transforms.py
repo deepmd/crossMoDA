@@ -3,40 +3,10 @@ from typing import Mapping, Hashable, Dict, Sequence, Optional, Callable, Union,
 import numpy as np
 import torch
 from copy import deepcopy
-from monai.config import KeysCollection, DtypeLike
-from monai.transforms.spatial.dictionary import GridSampleModeSequence, GridSamplePadModeSequence
-from monai.utils import GridSampleMode, GridSamplePadMode, ensure_tuple
+from monai.config import KeysCollection
+from monai.utils import ensure_tuple
 from monai.transforms import \
-    MapTransform, Randomizable, Compose, ConcatItemsd, DeleteItemsd, Lambdad, Spacingd, Transform, CopyItemsd
-
-
-class Spacing2Dd(Spacingd):
-    def __init__(
-            self,
-            keys: KeysCollection,
-            pixdim: Sequence[float],
-            diagonal: bool = False,
-            mode: GridSampleModeSequence = GridSampleMode.BILINEAR,
-            padding_mode: GridSamplePadModeSequence = GridSamplePadMode.BORDER,
-            align_corners: Union[Sequence[bool], bool] = False,
-            dtype: Optional[Union[Sequence[DtypeLike], DtypeLike]] = np.float64,
-            meta_key_postfix: str = "meta_dict",
-            allow_missing_keys: bool = False,
-    ) -> None:
-        if len(pixdim) != 2:
-            raise ValueError(f"pixdim must have two values, got {len(pixdim)}.")
-        super(Spacing2Dd, self).__init__(keys, pixdim, diagonal, mode, padding_mode, align_corners, dtype,
-                                         meta_key_postfix, allow_missing_keys)
-
-    def __call__(
-            self, data: Mapping[Union[Hashable, str], Dict[str, np.ndarray]]
-    ) -> Dict[Union[Hashable, str], Union[np.ndarray, Dict[str, np.ndarray]]]:
-        meta_data_key = f"{self.keys[0]}_{self.meta_key_postfix}"
-        meta_data = data[meta_data_key]
-        pixdim_z = meta_data["pixdim"][3]
-        pixdim = self.spacing_transform.pixdim
-        self.spacing_transform.pixdim = np.array([pixdim[0], pixdim[1], pixdim_z])
-        return super(Spacing2Dd, self).__call__(data)
+    MapTransform, Randomizable, Compose, ConcatItemsd, DeleteItemsd, Lambdad, Transform, CopyItemsd
 
 
 class AlignCropd(MapTransform):

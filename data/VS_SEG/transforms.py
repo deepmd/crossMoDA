@@ -1,11 +1,11 @@
 import numpy as np
 from data.transforms import \
-    RandMultiTransformd, RandSampleSlice, Spacing2Dd, AlignCropd, EndOfCache, KeepOriginald, \
+    RandMultiTransformd, RandSampleSlice, AlignCropd, EndOfCache, KeepOriginald, \
     MapSegLabelToClassLabel, AddPartitionIndex
 from monai.transforms import \
     Compose, LoadImaged, AddChanneld, NormalizeIntensityd, ScaleIntensityRangePercentilesd, \
     RandFlipd, RandSpatialCropd, RandScaleIntensityd, Orientationd, ToTensord, RandAffined, \
-    RandShiftIntensityd, RandGaussianNoised, CenterSpatialCropd
+    RandShiftIntensityd, RandGaussianNoised, CenterSpatialCropd, Spacingd, RandZoom
 
 
 def encoder_train_transforms(opt, domain):
@@ -33,7 +33,7 @@ def encoder_train_transforms(opt, domain):
                 LoadImaged(keys=["image"]),
                 AddChanneld(keys=["image"]),
                 Orientationd(keys=["image"], axcodes="RAS"),
-                Spacing2Dd(keys=["image"], pixdim=_base_pixdim, mode="bilinear"),
+                Spacingd(keys=["image"], pixdim=_base_pixdim, mode="bilinear"),
                 NormalizeIntensityd(keys=["image"]),
                 # N4BiasFieldCorrection
                 # ScaleIntensityRangePercentilesd(keys=["image"], lower=1, upper=99, b_min=0, b_max=1),
@@ -51,7 +51,7 @@ def encoder_train_transforms(opt, domain):
                 LoadImaged(keys=["image", "label"]),
                 AddChanneld(keys=["image", "label"]),
                 Orientationd(keys=["image", "label"], axcodes="RAS"),
-                Spacing2Dd(keys=["image", "label"], pixdim=_base_pixdim, mode=("bilinear", "nearest")),
+                Spacingd(keys=["image", "label"], pixdim=_base_pixdim, mode=("bilinear", "nearest")),
                 NormalizeIntensityd(keys=["image"]),
                 AlignCropd(keys=["image", "label"], align_roi=align_roi),
                 EndOfCache(),
@@ -72,7 +72,7 @@ def encoder_val_transforms(opt, domain):
                 LoadImaged(keys=["image"]),
                 AddChanneld(keys=["image"]),
                 Orientationd(keys=["image"], axcodes="RAS"),
-                Spacing2Dd(keys=["image"], pixdim=_base_pixdim, mode="bilinear"),
+                Spacingd(keys=["image"], pixdim=_base_pixdim, mode="bilinear"),
                 NormalizeIntensityd(keys=["image"]),
                 AlignCropd(keys=["image"], align_roi=align_roi),
                 EndOfCache(),
@@ -87,7 +87,7 @@ def encoder_val_transforms(opt, domain):
                 LoadImaged(keys=["image", "label"]),
                 AddChanneld(keys=["image", "label"]),
                 Orientationd(keys=["image", "label"], axcodes="RAS"),
-                Spacing2Dd(keys=["image", "label"], pixdim=_base_pixdim, mode=("bilinear", "nearest")),
+                Spacingd(keys=["image", "label"], pixdim=_base_pixdim, mode=("bilinear", "nearest")),
                 NormalizeIntensityd(keys=["image"]),
                 AlignCropd(keys=["image", "label"], align_roi=align_roi),
                 EndOfCache(),
@@ -107,7 +107,7 @@ def supervised_train_transforms(opt, domain):
             LoadImaged(keys=["image", "label"]),
             AddChanneld(keys=["image", "label"]),
             Orientationd(keys=["image", "label"], axcodes="RAS"),
-            Spacing2Dd(keys=["image", "label"], pixdim=_base_pixdim, mode=("bilinear", "nearest")),
+            Spacingd(keys=["image", "label"], pixdim=_base_pixdim, mode=("bilinear", "nearest")),
             NormalizeIntensityd(keys=["image"]),
             AlignCropd(keys=["image", "label"], align_roi=align_roi),
             EndOfCache(),
@@ -130,7 +130,7 @@ def supervised_val_transforms(opt, domain):
             LoadImaged(keys=["image", "label"]),
             AddChanneld(keys=["image", "label"]),
             Orientationd(keys=["image", "label"], axcodes="RAS"),
-            Spacing2Dd(keys=["image", "label"], pixdim=_base_pixdim, mode=("bilinear", "nearest")),
+            Spacingd(keys=["image", "label"], pixdim=_base_pixdim, mode=("bilinear", "nearest")),
             NormalizeIntensityd(keys=["image"]),
             AlignCropd(keys=["image", "label"], align_roi=align_roi),
             EndOfCache(),
@@ -141,7 +141,7 @@ def supervised_val_transforms(opt, domain):
     )
 
 
-_base_pixdim = [0.41015625, 0.41015625]
+_base_pixdim = [0.41015625, 0.41015625, -1]
 
 
 def _get_align_roi(domain):
